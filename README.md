@@ -50,6 +50,8 @@ Genre radios: replace existing genre; keep existing genre on audio; keep existin
 
 Windows 10 or later. The window uses Windows 2.03 chrome (flat black frames, inverted caption, checkerboard dither) and the Explorer folder picker.
 
+Current look bugs (scrollbars and open dropdown lists) are listed in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
 ## Build
 
 This crate targets `x86_64-pc-windows-gnu` (`rust-toolchain.toml`).
