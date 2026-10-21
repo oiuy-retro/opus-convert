@@ -1,5 +1,5 @@
-//! Windows 2.03 look: flat black frames, inverted caption, 50% checkerboard dither
-//! (the pattern Windows 1.x/2.x used for gray on EGA/CGA).
+//! Windows 2.03 look: flat black frames, inverted caption, and 2.03 gray
+//! (checkerboard grayed-out text, scroll-bar track pattern; see issue #8).
 
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -89,6 +89,129 @@ fn fill3(hdc: HDC, r: RECT, c: (u8, u8, u8)) {
 pub fn fill_dither(hdc: HDC, r: RECT) {
     unsafe {
         let _ = FillRect(hdc, &r, dither_brush());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows 2.03 gray, measured from real 2.03 screenshots (issue #8):
+// * Grayed-out text (e.g. the "Restore" menu item, DigiBarn win203misc.gif)
+//   is the normal black text with every other pixel removed in a 50%
+//   checkerboard (what GrayString did), on the normal white background.
+//   `gray_keep` is that checkerboard, `gray_text` draws text that way.
+// * Windows 2.03 had no progress bar (Setup only printed "Setup is copying
+//   ..."), so for the progress bar we use the pattern the user preferred: the
+//   2.03 scroll-bar track (black, every 4th pixel white, rows shifted by 2).
+// Each 2.03 pixel is drawn as a `gray_unit` square so it stays crisp.
+// ---------------------------------------------------------------------------
+
+/// 2.03 pixel size at this DPI: 1 up to 150%, 2 at 175-250%, ...
+pub fn gray_unit(dpi: i32) -> i32 {
+    ((dpi + 24) / 96).max(1)
+}
+
+fn dc_unit(hdc: HDC) -> i32 {
+    let dpi = unsafe { windows::Win32::Graphics::Gdi::GetDeviceCaps(hdc, windows::Win32::Graphics::Gdi::LOGPIXELSX) };
+    gray_unit(if dpi > 0 { dpi } else { 96 })
+}
+
+/// True where grayed-out text keeps its black pixel (2.03 GrayString checkerboard).
+pub fn gray_keep(x: i32, y: i32) -> bool {
+    (x + y).rem_euclid(2) == 0
+}
+
+/// True where the 2.03 scroll-bar track pattern is black (every 4th pixel
+/// white, rows shifted by 2). Same pattern as PR #4's `track_pixel` (which
+/// returns true for the white pixels); unify once PR #4 is merged.
+pub fn win2_track_black(x: i32, y: i32) -> bool {
+    (x + 2 * (y & 1)).rem_euclid(4) != 2
+}
+
+/// Monochrome pattern brush, `u` screen pixels per 2.03 pixel, for a pattern
+/// that repeats every `cw` x `ch` 2.03 pixels; `black(x, y)` picks the black
+/// pixels. Use it with text colour black and background white.
+fn pattern_brush(u: i32, cw: i32, ch: i32, black: impl Fn(i32, i32) -> bool) -> (HBRUSH, windows::Win32::Graphics::Gdi::HBITMAP) {
+    let w = cw * u;
+    let h = ch * u;
+    let stride = (((w + 15) / 16) * 2) as usize;
+    let mut bits = vec![0u8; stride * h as usize];
+    for y in 0..h {
+        for x in 0..w {
+            // 1 bits take the background colour (white), 0 bits the text colour (black).
+            if !black(x / u, y / u) {
+                bits[y as usize * stride + (x / 8) as usize] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    unsafe {
+        let bmp = CreateBitmap(w, h, 1, 1, Some(bits.as_ptr() as *const _));
+        (CreatePatternBrush(bmp), bmp)
+    }
+}
+
+/// Fill `r` with a black/white pattern aligned to the DC's origin.
+fn fill_pattern(hdc: HDC, r: RECT, u: i32, cw: i32, ch: i32, black: impl Fn(i32, i32) -> bool) {
+    unsafe {
+        let (brush, bmp) = pattern_brush(u, cw, ch, black);
+        let old_text = SetTextColor(hdc, rgb3(BLACK));
+        let old_back = windows::Win32::Graphics::Gdi::SetBkColor(hdc, rgb3(WHITE));
+        let mut old_org = POINT::default();
+        let _ = windows::Win32::Graphics::Gdi::SetBrushOrgEx(hdc, 0, 0, Some(&mut old_org));
+        let _ = FillRect(hdc, &r, brush);
+        let _ = windows::Win32::Graphics::Gdi::SetBrushOrgEx(hdc, old_org.x, old_org.y, None);
+        windows::Win32::Graphics::Gdi::SetBkColor(hdc, old_back);
+        SetTextColor(hdc, old_text);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(bmp);
+    }
+}
+
+/// Fill with the 2.03 scroll-bar track pattern.
+pub fn fill_track(hdc: HDC, r: RECT) {
+    fill_pattern(hdc, r, dc_unit(hdc), 4, 2, win2_track_black);
+}
+
+/// Draw `text` grayed out the Windows 2.03 way: normal black text with every
+/// other pixel (50% checkerboard) left white. Draws over whatever is there,
+/// so the area should be white already.
+pub fn gray_text(hdc: HDC, font: HFONT, r: RECT, text: &[u16], flags: u32) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w <= 0 || h <= 0 || text.is_empty() {
+        return;
+    }
+    let u = dc_unit(hdc);
+    unsafe {
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old_bmp = SelectObject(mem, bmp);
+        let local = RECT { left: 0, top: 0, right: w, bottom: h };
+        fill3(mem, local, WHITE);
+        let old_font = if !font.0.is_null() { Some(SelectObject(mem, font)) } else { None };
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, rgb3(BLACK));
+        let mut buf = text.to_vec();
+        let mut tr = local;
+        let _ = DrawTextW(mem, &mut buf, &mut tr, windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(flags));
+        // Whiten every other pixel: dest = dest OR pattern, with the pattern
+        // white where the checkerboard drops a pixel. Offset by r.left/top so
+        // the checkerboard lines up with the window, like the 2.03 one.
+        let (ox, oy) = (r.left.rem_euclid(2 * u) / u, r.top.rem_euclid(2 * u) / u);
+        let (brush, pbmp) = pattern_brush(u, 2, 2, move |x, y| gray_keep(x + ox, y + oy));
+        SetTextColor(mem, rgb3(BLACK));
+        windows::Win32::Graphics::Gdi::SetBkColor(mem, rgb3(WHITE));
+        let old_brush = SelectObject(mem, brush);
+        let _ = windows::Win32::Graphics::Gdi::PatBlt(mem, 0, 0, w, h, windows::Win32::Graphics::Gdi::ROP_CODE(0x00FA0089));
+        SelectObject(mem, old_brush);
+        // Copy only the black pixels onto the target (dest AND source).
+        let _ = BitBlt(hdc, r.left, r.top, w, h, mem, 0, 0, windows::Win32::Graphics::Gdi::SRCAND);
+        if let Some(f) = old_font {
+            SelectObject(mem, f);
+        }
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pbmp);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
     }
 }
 
@@ -281,6 +404,14 @@ pub fn thicken(hwnd: HWND) {
         let mut name = [0u16; 32];
         let n = GetClassNameW(hwnd, &mut name);
         let class = String::from_utf16_lossy(&name[..n as usize]);
+        if class == "Static" {
+            // Disabled labels are grayed out the Windows 2.03 way.
+            let old = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, old);
+            let ours: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = static_proc;
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ours as isize);
+            return;
+        }
         if class != "Edit" && class != "SysListView32" && class != "ComboBox" && class != "OpusWorkList" {
             return;
         }
@@ -300,6 +431,54 @@ pub fn thicken(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
+}
+
+/// Plain text labels (SS_LEFT and friends): when disabled, paint the text
+/// grayed out with the 2.03 checkerboard instead of Windows' solid gray.
+unsafe extern "system" fn static_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let prev: windows::Win32::UI::WindowsAndMessaging::WNDPROC = std::mem::transmute(old);
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    // Only text statics: SS_LEFT (0), SS_CENTER (1), SS_RIGHT (2), SS_LEFTNOWORDWRAP (0xC).
+    let kind = style & 0x1F;
+    let text_kind = matches!(kind, 0 | 1 | 2 | 0xC);
+    if msg == WM_ENABLE && text_kind {
+        let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        let _ = InvalidateRect(hwnd, None, true);
+        return result;
+    }
+    if msg == WM_PAINT && text_kind && !IsWindowEnabled(hwnd).as_bool() {
+        let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut c = RECT::default();
+        let _ = GetClientRect(hwnd, &mut c);
+        // Background exactly as the parent would give it (WM_CTLCOLORSTATIC).
+        let parent = GetParent(hwnd).unwrap_or_default();
+        let brush = HBRUSH(SendMessageW(parent, 0x0138, WPARAM(hdc.0 as usize), LPARAM(hwnd.0 as isize)).0 as *mut _);
+        if !brush.0.is_null() {
+            let _ = FillRect(hdc, &c, brush);
+        } else {
+            fill3(hdc, c, WHITE);
+        }
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let mut flags = match kind {
+                1 => DT_CENTER.0 | 0x10,
+                2 => windows::Win32::Graphics::Gdi::DT_RIGHT.0 | 0x10,
+                0xC => DT_LEFT.0 | DT_SINGLELINE.0,
+                _ => DT_LEFT.0 | 0x10, // DT_WORDBREAK
+            };
+            if style & 0x80 != 0 {
+                flags |= DT_NOPREFIX.0;
+            }
+            gray_text(hdc, font, c, &buf[..len as usize], flags);
+        }
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
 }
 
 unsafe extern "system" fn thick_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -338,7 +517,7 @@ unsafe extern "system" fn thick_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     if msg == WM_ERASEBKGND && edit && !IsWindowEnabled(hwnd).as_bool() {
         let mut c = RECT::default();
         let _ = GetClientRect(hwnd, &mut c);
-        fill_dither(HDC(wparam.0 as *mut _), c);
+        fill3(HDC(wparam.0 as *mut _), c, WHITE);
         return LRESULT(1);
     }
     if msg == WM_SETFONT && edit {
@@ -423,41 +602,27 @@ fn pad_edit(hwnd: HWND) {
 }
 
 fn paint_disabled_edit(hwnd: HWND) {
+    // Windows 2.03 style: the field stays white and its text is grayed out
+    // with the 2.03 checkerboard (no patterned background, which made the
+    // text hard to read).
     unsafe {
         let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut c = RECT::default();
         let _ = GetClientRect(hwnd, &mut c);
-        fill_dither(hdc, c);
+        fill3(hdc, c, WHITE);
         let mut buf = [0u16; 512];
         let len = GetWindowTextW(hwnd, &mut buf);
         if len > 0 {
             let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
-            let old = if !font.0.is_null() {
-                SelectObject(hdc, font)
-            } else {
-                std::mem::zeroed()
-            };
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, rgb3(BLACK));
-            let mut tr = RECT {
-                left: 2,
-                top: 0,
-                right: c.right - 2,
-                bottom: c.bottom,
-            };
-            let mut wide: Vec<u16> = buf[..len as usize].to_vec();
-            let _ = DrawTextW(
+            let tr = RECT { left: 2, top: 0, right: c.right - 2, bottom: c.bottom };
+            gray_text(
                 hdc,
-                &mut wide,
-                &mut tr,
-                windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
-                    DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
-                ),
+                font,
+                tr,
+                &buf[..len as usize],
+                DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
             );
-            if !font.0.is_null() {
-                SelectObject(hdc, old);
-            }
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -478,7 +643,21 @@ fn paint_nc_frame(hwnd: HWND, edge: i32) {
         let ct = origin.y - wr.top;
         let _ = ExcludeClipRect(dc, cl, ct, cl + cr.right, ct + cr.bottom);
         fill3(dc, RECT { left: 0, top: 0, right: w, bottom: h }, WHITE);
-        thick_box(dc, RECT { left: 0, top: 0, right: w, bottom: h }, edge);
+        let mut cname = [0u16; 16];
+        let cn = GetClassNameW(hwnd, &mut cname);
+        let disabled_edit = String::from_utf16_lossy(&cname[..cn as usize]) == "Edit" && !IsWindowEnabled(hwnd).as_bool();
+        if disabled_edit {
+            // No 2.03 screenshot shows a disabled text field, so (as the user
+            // prefers) its frame uses the 2.03 scroll-bar track pattern. That
+            // keeps an empty disabled field recognisable without covering
+            // the text.
+            fill_track(dc, RECT { left: 0, top: 0, right: w, bottom: edge });
+            fill_track(dc, RECT { left: 0, top: h - edge, right: w, bottom: h });
+            fill_track(dc, RECT { left: 0, top: 0, right: edge, bottom: h });
+            fill_track(dc, RECT { left: w - edge, top: 0, right: w, bottom: h });
+        } else {
+            thick_box(dc, RECT { left: 0, top: 0, right: w, bottom: h }, edge);
+        }
         let _ = SelectClipRgn(dc, HRGN(std::ptr::null_mut()));
         let _ = ReleaseDC(hwnd, dc);
     }
@@ -623,29 +802,36 @@ fn paint_window(hwnd: HWND) {
     }
 }
 
-/// Flat black-bordered well; fill is solid black (Win 2.x had no glossy bar).
+/// Flat black-bordered well. Windows 2.03 had no progress bar, so this uses
+/// the pattern the user chose: the empty part is white and the done part is
+/// filled with the 2.03 scroll-bar track pattern.
 pub fn paint(hdc: HDC, bounds: RECT, fraction: f64, failed: bool, _animate: bool) {
+    let _ = failed;
     if bounds.right - bounds.left < 6 || bounds.bottom - bounds.top < 6 {
         return;
     }
     fill3(hdc, bounds, WHITE);
     black_box(hdc, bounds);
-    let inner = inset(bounds, 2);
-    fill_dither(hdc, inner);
+    let inner = inset(bounds, 3);
     let w = (inner.right - inner.left).max(0);
-    let fill_w = ((w as f64) * fraction.clamp(0.0, 1.0)).round() as i32;
+    let fill_w = progress_fill_width(w, fraction);
     if fill_w > 0 {
-        fill3(
+        fill_track(
             hdc,
             RECT {
                 left: inner.left,
                 top: inner.top,
-                right: inner.left + fill_w.min(w),
+                right: inner.left + fill_w,
                 bottom: inner.bottom,
             },
-            BLACK,
         );
     }
+}
+
+/// Width of the done part of a progress well `w` pixels wide.
+pub fn progress_fill_width(w: i32, fraction: f64) -> i32 {
+    let f = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+    (((w.max(0)) as f64) * f).round() as i32
 }
 
 pub fn enable_glass(_hwnd: HWND, _active: bool) {}
@@ -1112,17 +1298,17 @@ pub fn command_button(
         BLACK
     };
     let mut w: Vec<u16> = label.encode_utf16().collect();
-    unsafe {
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb3(color));
-        let _ = DrawTextW(
-            hdc,
-            &mut w,
-            &mut tr,
-            windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
-                DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
-            ),
-        );
+    let flags = DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0;
+    if !enabled {
+        // Grayed out the Windows 2.03 way (checkerboard text).
+        let font = HFONT(unsafe { windows::Win32::Graphics::Gdi::GetCurrentObject(hdc, windows::Win32::Graphics::Gdi::OBJ_FONT) }.0);
+        gray_text(hdc, font, tr, &w, flags);
+    } else {
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, rgb3(color));
+            let _ = DrawTextW(hdc, &mut w, &mut tr, windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(flags));
+        }
     }
     if focus && enabled && !press {
         black_box(hdc, inset(bounds, 3));
@@ -1278,8 +1464,12 @@ fn paint_toggle(hwnd: HWND, radio: bool) {
             bottom: client.bottom,
         };
         let font = HFONT(get_long(hwnd, CTL_FONT) as *mut _);
-        let color = if enabled { BLACK } else { (128, 128, 128) };
-        if !font.0.is_null() {
+        let color = BLACK;
+        if !enabled {
+            // Grayed out the Windows 2.03 way (checkerboard text).
+            let w: Vec<u16> = label.encode_utf16().collect();
+            gray_text(hdc, font, tr, &w, DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0);
+        } else if !font.0.is_null() {
             text_left(hdc, font, tr, &label, color);
         } else {
             let mut w: Vec<u16> = label.encode_utf16().collect();
@@ -1318,5 +1508,59 @@ mod tests {
         let b = rgb(255, 255, 255);
         assert_eq!(mix(a, b, 0.0), a);
         assert_eq!(mix(a, b, 1.0), b);
+    }
+
+    /// Rows 32-40 of the grayed "Restore" menu item in a real Windows 2.03
+    /// screenshot (DigiBarn win203misc.gif), starting at screen x = 365.
+    /// Every black pixel sits on the same checkerboard colour.
+    const WIN203_GRAYED_RESTORE: [&str; 9] = [
+        ".....#.#.....................#...................................",
+        "....#...#.....................#..................................",
+        ".....#...#...#.#.....#.#.#...#.#.#...#.#.....#...#...#.#.........",
+        "....#...#...#...#...#.........#.....#...#...#...#...#...#........",
+        ".....#.#.....#...#...#.......#.......#...#...#.......#...#.......",
+        "....#...#...#.#.#.....#.#.....#.....#...#...#.......#.#.#........",
+        ".....#...#...#...........#...#.......#...#...#.......#...........",
+        "....#...#...#...........#.....#.....#...#...#.......#............",
+        ".....#...#...#.#.....#.#.......#.#...#.#.....#.......#.#.........",
+    ];
+
+    #[test]
+    fn grayed_text_uses_the_windows_203_checkerboard() {
+        let mut count = 0;
+        for (r, row) in WIN203_GRAYED_RESTORE.iter().enumerate() {
+            for (c, ch) in row.chars().enumerate() {
+                if ch == '#' {
+                    assert!(gray_keep(365 + c as i32, 32 + r as i32), "row {} col {}", r, c);
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 60);
+        // Exactly half the pixels are kept.
+        let kept = (0..8).flat_map(|y| (0..8).map(move |x| (x, y))).filter(|&(x, y)| gray_keep(x, y)).count();
+        assert_eq!(kept, 32);
+    }
+
+    #[test]
+    fn track_pattern_matches_windows_203_scrollbar() {
+        // Two rows of the 2.03 scroll-bar track ('#' black), as in PR #4's test.
+        let rows = ["#.###.###.###", "###.###.###.#"];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, ch) in row.chars().enumerate() {
+                assert_eq!(win2_track_black(c as i32 + 1, 16 + r as i32), ch == '#', "row {} col {}", r, c);
+            }
+        }
+    }
+
+    #[test]
+    fn progress_fill_is_clamped() {
+        assert_eq!(progress_fill_width(200, 0.0), 0);
+        assert_eq!(progress_fill_width(200, 0.5), 100);
+        assert_eq!(progress_fill_width(200, 2.0), 200);
+        assert_eq!(progress_fill_width(200, -1.0), 0);
+        assert_eq!(progress_fill_width(200, f64::NAN), 0);
+        assert_eq!(gray_unit(96), 1);
+        assert_eq!(gray_unit(192), 2);
     }
 }
