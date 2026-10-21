@@ -2,7 +2,7 @@
 
 Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
-A built copy is in [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`) in the same folder as the program.
+A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/releases/latest/download/Opus.Convert.exe) on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`) in the same folder as the program.
 ```
 sha256: 42fe55dbc004eeb62d6b27f725724715ed9a0661fa8ec242ac37e8a3b18d7464
 ```
@@ -46,7 +46,7 @@ Genre radios: replace existing genre; keep existing genre on audio; keep existin
 
 ## Run
 
-1. Copy `dist/Opus Convert.exe` to a folder.
+1. Copy `Opus.Convert.exe` from the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest) to a folder.
 2. Place [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg.exe` and `ffprobe.exe` beside it (both ship in the same build).
 3. Optional: `lastfm.key`, [`python.exe`](https://www.python.org/downloads/release/python-379/) (with [musicnn](https://github.com/jordipons/musicnn)), and `musicnn-one.py`.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
