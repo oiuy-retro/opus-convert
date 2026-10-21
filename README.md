@@ -3,9 +3,6 @@
 Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
 A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/releases/latest/download/Opus.Convert.exe) on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`) in the same folder as the program.
-```
-sha256: 42fe55dbc004eeb62d6b27f725724715ed9a0661fa8ec242ac37e8a3b18d7464
-```
 
 ## What it does
 
