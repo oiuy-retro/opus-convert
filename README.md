@@ -35,18 +35,26 @@ Album art is saved inside each output file as `cover.jpg`. Opus Convert uses the
 
 PNG and WebP images are converted to JPEG.
 
-## Genre lookup (optional)
+## Genre lookup
 
-When **Look up genre** is on, lookup runs after convert on the output files.
+When **Look up genre** is ticked, genre lookup runs after every file has been converted and the tags you entered have been written. Each file is looked up in this order:
 
-1. Last.fm `track.getTopTags` with autocorrect off, if a key is present.
-2. Files Last.fm does not match go to [musicnn](https://github.com/jordipons/musicnn).
+1. Last.fm `track.getTopTags` for the exact artist and title, if you have an API key.
+2. [musicnn](https://github.com/jordipons/musicnn) for every file Last.fm doesn't match.
 
-Type a Last.fm API key in the Options box (under Look up genre). It is stored in `%AppData%\Opus Convert\lastfm.key` and is remembered after a restart. You can also use `lastfm.key` next to the exe (see `lastfm.key.example`) or the `LASTFM_API_KEY` environment variable. Without a key, Last.fm is skipped and musicnn still runs if [Python](https://www.python.org/downloads/release/python-379/) is present.
+Up to two genres are written per file.
 
-musicnn needs a portable Python with the packages listed in [THIRD_PARTY.md](THIRD_PARTY.md), plus `musicnn-one.py` next to the exe.
+Enter your Last.fm API key in the **Last.fm key** field on the Options page. It's saved to `%AppData%\Opus Convert\lastfm.key`. You can also put it in `lastfm.key` next to the exe (see `lastfm.key.example`) or set `LASTFM_API_KEY`. Without a key, every file goes to musicnn.
 
-Genre radios: replace existing genre; keep existing genre on audio; keep existing genre on audio except YouTube categories (Music, People & Blogs, and the rest).
+musicnn needs [Python](https://www.python.org/downloads/release/python-379/) (`python.exe`) with the packages listed in [THIRD_PARTY.md](THIRD_PARTY.md), plus `musicnn-one.py`, next to the exe. With **Look up genre** ticked, Convert won't start if either is missing.
+
+Choose what happens to a genre a file already has:
+
+- **Replace existing genre**: look up every file and replace its genre tags with what's found.
+- **Keep existing genre on audio**: keep existing genre tags and only fill in empty ones.
+- **Keep existing genre on audio, except YouTube categories**: keep existing genre tags, but remove YouTube categories (as yt-dlp writes them) and fill in empty ones. If only YouTube categories were there, the file is looked up. These count as YouTube categories, in any letter case: Autos & Vehicles, Comedy, Education, Entertainment, Film & Animation, Game, Gaming, Howto & Style, Movies, Music, News & Politics, Nonprofits & Activism, People & Blogs, Pets & Animals, Science & Technology, Shows, Sports, Travel & Events.
+
+Video files are always looked up, whichever option you choose.
 
 ## Run
 
