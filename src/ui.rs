@@ -478,6 +478,19 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     if matches!(msg, 0x0138 | 0x0135 | 0x0133 | 0x0134) {
         return paint_control(msg, wparam, lparam);
     }
+    // WM_DRAWITEM: items of the Windows 3.0 style drop-down lists.
+    if msg == 0x002B && crate::aero::draw_combo_item(lparam) {
+        return LRESULT(1);
+    }
+    // WM_MEASUREITEM: a sensible default; App::size_combo_items fixes it up
+    // once the font is known.
+    if msg == 0x002C && lparam.0 != 0 {
+        let m = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+        if m.CtlType.0 == 3 {
+            m.itemHeight = 18;
+            return LRESULT(1);
+        }
+    }
     if matches!(msg, WM_COMMAND | WM_NOTIFY | WM_VSCROLL | WM_MOUSEWHEEL) && !IN_CALLBACK.get() {
         let parent = GetParent(hwnd).unwrap_or(HWND(std::ptr::null_mut()));
         return SendMessageW(parent, msg, wparam, lparam);
@@ -1662,10 +1675,46 @@ impl App {
     }
 
     fn combo(&mut self, x: i32, y: i32, w: i32, id: i32) -> HWND {
-        let hwnd = self.make(self.host, "ComboBox", "", 0x40000000 | 0x10000000 | 0x10000 | 0x3 | 0x200 | 0x00200000, 0, x, y, w, self.s(160), id);
+        // 0x10 = CBS_OWNERDRAWFIXED: the opened list's items are drawn by
+        // aero::draw_combo_item in the Windows 3.0 style (black highlight).
+        let hwnd = self.make(self.host, "ComboBox", "", 0x40000000 | 0x10000000 | 0x10000 | 0x3 | 0x10 | 0x200 | 0x00200000, 0, x, y, w, self.s(160), id);
         self.set_anchor(hwnd, Anchor::Fixed);
+        self.size_combo_items(hwnd);
+        crate::aero::style_combo_list(hwnd);
         self.clip_closed_combo(hwnd);
         hwnd
+    }
+
+    /// Owner-draw combos get their item heights from WM_MEASUREITEM before the
+    /// font is set, so size them here: list rows fit the text, and the closed
+    /// box keeps the app's usual 26px field height.
+    fn size_combo_items(&self, hwnd: HWND) {
+        if hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let dc = GetDC(hwnd);
+            let old = if !font.0.is_null() { SelectObject(dc, font) } else { windows::Win32::Graphics::Gdi::HGDIOBJ::default() };
+            let mut tm = windows::Win32::Graphics::Gdi::TEXTMETRICW::default();
+            let _ = windows::Win32::Graphics::Gdi::GetTextMetricsW(dc, &mut tm);
+            if !font.0.is_null() {
+                SelectObject(dc, old);
+            }
+            ReleaseDC(hwnd, dc);
+            let row = (tm.tmHeight + self.s(2)).max(self.s(14));
+            SendMessageW(hwnd, 0x0153, WPARAM(0), LPARAM(row as isize));
+            // CB_SETITEMHEIGHT(-1) sets the box's text area; the frame adds a
+            // few pixels, so set it, measure, and correct once.
+            let want = self.s(26);
+            let mut item = want - 6;
+            SendMessageW(hwnd, 0x0153, WPARAM(usize::MAX), LPARAM(item as isize));
+            let got = crate::aero::combo_face_height(hwnd);
+            if got != want && got > 0 {
+                item = (item + want - got).max(row);
+                SendMessageW(hwnd, 0x0153, WPARAM(usize::MAX), LPARAM(item as isize));
+            }
+        }
     }
 
     fn clip_closed_combo(&self, hwnd: HWND) {
@@ -2046,6 +2095,8 @@ impl App {
                 } else {
                     self.clip_closed_combo(hwnd);
                 }
+                // Repaint the 3.0 arrow button pressed (open) or raised (closed).
+                unsafe { let _ = InvalidateRect(hwnd, None, false); }
             }
         }
         if id == ID_BACK && code == 0 {
