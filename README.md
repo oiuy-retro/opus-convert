@@ -35,7 +35,7 @@ When **Look up genre** is on, lookup runs after convert on the output files.
 1. Last.fm `track.getTopTags` with autocorrect off, if a key is present.
 2. Files Last.fm does not match go to [musicnn](https://github.com/jordipons/musicnn).
 
-Provide a Last.fm API key as `lastfm.key` next to the exe (see `lastfm.key.example`) or the `LASTFM_API_KEY` environment variable. Without a key, Last.fm is skipped and musicnn still runs if Python is present.
+Type a Last.fm API key in the Options box (under Look up genre). It is stored in `%AppData%\Opus Convert\lastfm.key` and is remembered after a restart. You can also use `lastfm.key` next to the exe (see `lastfm.key.example`) or the `LASTFM_API_KEY` environment variable. Without a key, Last.fm is skipped and musicnn still runs if Python is present.
 
 musicnn needs a portable Python with the packages listed in [THIRD_PARTY.md](THIRD_PARTY.md), plus `musicnn-one.py` next to the exe.
 

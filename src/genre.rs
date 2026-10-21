@@ -55,6 +55,49 @@ const ALLOWED: &[&str] = &[
     "ambient techno", "intelligent dance music",
 ];
 
+fn read_key_file(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .unwrap_or_default()
+}
+
+pub fn stored_key_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("Opus Convert").join("lastfm.key")
+}
+
+pub fn save_key_to(path: &Path, key: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let key = key.trim();
+    if key.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    }
+    std::fs::write(path, key).map_err(|err| err.to_string())
+}
+
+pub fn save_stored_key(key: &str) -> Result<(), String> {
+    save_key_to(&stored_key_path(), key)
+}
+
+/// Key shown in the Options box. AppData first, then `lastfm.key` beside the exe.
+pub fn key_for_box() -> String {
+    let stored = read_key_file(&stored_key_path());
+    if !stored.is_empty() {
+        return stored;
+    }
+    if let Ok(dir) = crate::tools::exe_dir() {
+        return read_key_file(&dir.join("lastfm.key"));
+    }
+    String::new()
+}
+
 pub fn api_key() -> String {
     if let Ok(key) = std::env::var("LASTFM_API_KEY") {
         let key = key.trim().to_string();
@@ -62,14 +105,12 @@ pub fn api_key() -> String {
             return key;
         }
     }
+    let stored = read_key_file(&stored_key_path());
+    if !stored.is_empty() {
+        return stored;
+    }
     if let Ok(dir) = crate::tools::exe_dir() {
-        let path = dir.join("lastfm.key");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let key = text.trim();
-            if !key.is_empty() {
-                return key.to_string();
-            }
-        }
+        return read_key_file(&dir.join("lastfm.key"));
     }
     String::new()
 }
@@ -345,6 +386,16 @@ mod tests {
     #[test]
     fn lastfm_skips_empty_key() {
         assert_eq!(lastfm_genres("Artist", "Title", "").unwrap(), None);
+    }
+
+    #[test]
+    fn stored_key_round_trips_in_a_temp_file() {
+        let path = std::env::temp_dir().join(format!("opus-convert-lastfm-{}.key", std::process::id()));
+        save_key_to(&path, "  sample-key  ").unwrap();
+        assert_eq!(read_key_file(&path), "sample-key");
+        save_key_to(&path, "   ").unwrap();
+        assert_eq!(read_key_file(&path), "");
+        assert!(!path.exists());
     }
 
     #[test]

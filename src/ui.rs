@@ -87,6 +87,7 @@ const ID_GENRE: i32 = 26;
 const ID_GENRE_REPLACE: i32 = 27;
 const ID_GENRE_KEEP: i32 = 28;
 const ID_GENRE_YOUTUBE: i32 = 29;
+const ID_LASTFM_KEY: i32 = 30;
 const ID_LASTFM: i32 = 54;
 const ID_LASTFM_PCT: i32 = 55;
 const ID_MUSICNN: i32 = 56;
@@ -221,6 +222,8 @@ struct App {
     genre_replace_hwnd: HWND,
     genre_keep_hwnd: HWND,
     genre_youtube_hwnd: HWND,
+    lastfm_key_hwnd: HWND,
+    lastfm_key_label: HWND,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     caption_font: HFONT,
     active: bool,
@@ -746,6 +749,8 @@ impl App {
             genre_replace_hwnd: null,
             genre_keep_hwnd: null,
             genre_youtube_hwnd: null,
+            lastfm_key_hwnd: null,
+            lastfm_key_label: null,
             icon: load_icon(instance, 16),
             caption_font: aero::caption_font(dpi),
             active: true,
@@ -1287,6 +1292,13 @@ impl App {
             policy == GenrePolicy::KeepAudioExceptYoutube,
             false,
         );
+        y += self.s(22);
+        self.lastfm_key_label = self.label(radio_x, y + self.s(3), label_w, "Last.fm &key");
+        let key_x = radio_x + label_w + self.s(8);
+        let key_w = (w - key_x - self.s(16)).max(self.s(80));
+        self.lastfm_key_hwnd = self.edit(key_x, y, key_w, ID_LASTFM_KEY, false, false);
+        set_text(self.lastfm_key_hwnd, &crate::genre::key_for_box());
+        self.set_anchor(self.lastfm_key_hwnd, Anchor::StretchX);
         y += self.s(28);
         self.sync_genre_radios();
         y
@@ -1665,7 +1677,7 @@ impl App {
             let _ = GetWindowRect(hwnd, &mut rect);
         }
         let width = (rect.right - rect.left).max(1);
-        let height = self.s(24).max(1);
+        let height = crate::aero::combo_face_height(hwnd).max(self.s(26));
         unsafe {
             let region = CreateRectRgn(0, 0, width, height);
             if region.0.is_null() {
@@ -1699,6 +1711,15 @@ impl App {
         enable(self.genre_replace_hwnd, on);
         enable(self.genre_keep_hwnd, on);
         enable(self.genre_youtube_hwnd, on);
+        enable(self.lastfm_key_hwnd, on);
+        enable(self.lastfm_key_label, on);
+    }
+
+    fn persist_lastfm_key(&self) {
+        if self.lastfm_key_hwnd.0.is_null() {
+            return;
+        }
+        let _ = crate::genre::save_stored_key(&get_text(self.lastfm_key_hwnd));
     }
 
     fn selected_genre_policy(&self) -> GenrePolicy {
@@ -1803,6 +1824,8 @@ impl App {
         self.genre_replace_hwnd = null;
         self.genre_keep_hwnd = null;
         self.genre_youtube_hwnd = null;
+        self.lastfm_key_hwnd = null;
+        self.lastfm_key_label = null;
     }
 
     fn place(&self) {
@@ -2048,6 +2071,9 @@ impl App {
             if matches!(id, ID_INPUT | ID_OUTPUT) && code == EN_KILLFOCUS as u16 {
                 self.commit_folders();
                 store::save(&self.memory);
+            }
+            if id == ID_LASTFM_KEY && code == EN_KILLFOCUS as u16 {
+                self.persist_lastfm_key();
             }
             if matches!(
                 id,
@@ -2312,6 +2338,7 @@ impl App {
     fn harvest_soft(&mut self) {
         if self.page == 0 && !self.profile_hwnd.0.is_null() {
             self.options = self.current_options();
+            self.persist_lastfm_key();
         }
     }
 
@@ -2800,6 +2827,7 @@ impl App {
                     self.genre_youtube_hwnd,
                     "Skip audio with a real genre; strip YouTube categories like Music or People & Blogs and look those up",
                 ),
+                (self.lastfm_key_hwnd, "Last.fm API key; kept after restart"),
             ],
             _ => Vec::new(),
         };

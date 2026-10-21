@@ -5,14 +5,14 @@ use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-    CreatePen, CreatePatternBrush, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
-    ExcludeClipRect, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW, GetWindowDC,
-    InvalidateRect, ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    HBRUSH, HDC, HFONT, HPEN, HRGN, NULL_BRUSH, PS_SOLID, TEXTMETRICW, TRANSPARENT,
+    CreatePen, CreatePatternBrush, CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+    EndPaint, ExcludeClipRect, FillRect, GetDC, GetRgnBox, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW,
+    GetWindowDC, GetWindowRgn, InvalidateRect, ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
+    SetWindowRgn, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, HDC, HFONT, HPEN, HRGN, NULL_BRUSH, PS_SOLID, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::Controls::{EM_SETMARGINS, PBM_SETPOS, PBM_SETRANGE32};
+use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO, EM_SETMARGINS, PBM_SETPOS, PBM_SETRANGE32};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -429,6 +429,36 @@ fn paint_disabled_edit(hwnd: HWND) {
         let mut c = RECT::default();
         let _ = GetClientRect(hwnd, &mut c);
         fill_dither(hdc, c);
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let old = if !font.0.is_null() {
+                SelectObject(hdc, font)
+            } else {
+                std::mem::zeroed()
+            };
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, rgb3(BLACK));
+            let mut tr = RECT {
+                left: 2,
+                top: 0,
+                right: c.right - 2,
+                bottom: c.bottom,
+            };
+            let mut wide: Vec<u16> = buf[..len as usize].to_vec();
+            let _ = DrawTextW(
+                hdc,
+                &mut wide,
+                &mut tr,
+                windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
+                    DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
+                ),
+            );
+            if !font.0.is_null() {
+                SelectObject(hdc, old);
+            }
+        }
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -454,13 +484,44 @@ fn paint_nc_frame(hwnd: HWND, edge: i32) {
     }
 }
 
+pub fn combo_face_height(hwnd: HWND) -> i32 {
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        if GetComboBoxInfo(hwnd, &mut info).is_ok() {
+            let h = info.rcItem.bottom.max(info.rcButton.bottom);
+            if (9..=96).contains(&h) {
+                return h;
+            }
+        }
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        if GetWindowRgn(hwnd, rgn).0 != 0 {
+            let mut boxr = RECT::default();
+            if GetRgnBox(rgn, &mut boxr).0 != 0 {
+                let h = boxr.bottom - boxr.top;
+                let _ = DeleteObject(rgn);
+                if (9..=96).contains(&h) {
+                    return h;
+                }
+            } else {
+                let _ = DeleteObject(rgn);
+            }
+        } else {
+            let _ = DeleteObject(rgn);
+        }
+        26
+    }
+}
+
 fn paint_combo_face(hwnd: HWND) {
     unsafe {
         let dc = GetWindowDC(hwnd);
         let mut wr = RECT::default();
         let _ = GetWindowRect(hwnd, &mut wr);
         let w = wr.right - wr.left;
-        let h = wr.bottom - wr.top;
+        let h = combo_face_height(hwnd).max(22);
         let face = RECT { left: 0, top: 0, right: w, bottom: h };
         fill3(dc, face, WHITE);
         black_box(dc, face);
