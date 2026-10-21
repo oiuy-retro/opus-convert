@@ -1,13 +1,13 @@
 # Opus Convert
 
-Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
+Windows 2.03–style wizard that converts a folder tree to Opus audio in `.m4a`.
 
 A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/releases/latest/download/Opus.Convert.exe) on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest).
 
 ## What it does
 
 - Picks an input folder and an output folder, then walks every subfolder.
-- Encodes audio and video to Opus in Matroska. Video pictures are copied. Audio that is already Opus is remuxed, not re-encoded.
+- Encodes audio and video files to Opus in `.m4a`. Video files keep only their first audio track. Audio that is already Opus is remuxed, not re-encoded.
 - Copies every other file (cover images, text files, and anything else that isn't music or video) to the output folder unchanged.
 - Wizard pages: Options, Names, Titles, Metadata, Convert.
 - Profiles are stored in `%AppData%\Opus Convert\profiles.json`.
@@ -26,7 +26,7 @@ On Options you choose the profile, folders, whether to convert audio and/or vide
 
 ## Cover art
 
-Album art is saved inside each output file as `cover.jpg`. Opus Convert uses the first image it finds, in this order:
+Album art is embedded in each output file as its cover image. Opus Convert uses the first image it finds, in this order:
 
 1. Art already embedded in the source file
 2. An image with the same name as the song, like `Song.jpg`, `Song.jpeg`, `Song.png` or `Song.webp`

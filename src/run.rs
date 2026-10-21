@@ -260,7 +260,7 @@ fn convert_one(
     let work_dir = dest.parent().unwrap_or(Path::new("."));
     let cover = cover::prepare(ffmpeg, item, work_dir);
     let cover_path = cover.as_ref().map(|cover| cover.path.clone());
-    let partial = dest.with_extension("partial.mkv");
+    let partial = dest.with_extension("partial.m4a");
     let _ = fs::remove_file(paths::extended(&partial));
     let args = convert::ffmpeg_args(
         &item.source,
@@ -610,7 +610,7 @@ fn lastfm_one(
 
 fn write_genre(shared: &Arc<Shared>, ffmpeg: &Path, dest: &Path, genre: &str) -> Result<(), String> {
     let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = dest.extension().map(|ext| ext.to_string_lossy().to_string()).unwrap_or_else(|| "mkv".into());
+    let ext = dest.extension().map(|ext| ext.to_string_lossy().to_string()).unwrap_or_else(|| "m4a".into());
     let partial = dest.with_file_name(format!("{stem}.genre-partial.{ext}"));
     let args = convert::genre_args(dest, &partial, genre);
     let parked = shared.child.lock().expect("child").take();
@@ -918,68 +918,208 @@ mod tests {
         }
     }
 
+    fn ff(bundle: &crate::tools::Bundle, args: &[&str], out: &Path) {
+        let status = Command::new(&bundle.ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(args)
+            .arg(out)
+            .status()
+            .expect("ffmpeg");
+        assert!(status.success(), "could not make {}", out.display());
+    }
+
+    /// Streams of a file as ffprobe JSON.
+    fn streams(bundle: &crate::tools::Bundle, file: &Path) -> Vec<serde_json::Value> {
+        let out = Command::new(&bundle.ffprobe)
+            .args(["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format"])
+            .arg(file)
+            .output()
+            .expect("ffprobe");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        json["streams"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn format_tags(bundle: &crate::tools::Bundle, file: &Path) -> serde_json::Value {
+        let out = Command::new(&bundle.ffprobe)
+            .args(["-v", "quiet", "-print_format", "json", "-show_format"])
+            .arg(file)
+            .output()
+            .expect("ffprobe");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        json["format"]["tags"].clone()
+    }
+
+    /// Width of the attached picture, and the number of other video streams.
+    /// `Folder/File` under the output root, with Windows separators.
+    fn out_file(root: &Path, name: &str) -> PathBuf {
+        name.split('/').fold(root.to_path_buf(), |path, part| path.join(part))
+    }
+
+    fn cover_and_video(bundle: &crate::tools::Bundle, file: &Path) -> (Option<i64>, usize) {
+        let mut cover = None;
+        let mut video = 0;
+        for stream in streams(bundle, file) {
+            if stream["codec_type"] != "video" {
+                continue;
+            }
+            if stream["disposition"]["attached_pic"] == 1 {
+                assert_eq!(stream["codec_name"], "mjpeg", "cover must be JPEG");
+                cover = stream["width"].as_i64();
+            } else {
+                video += 1;
+            }
+        }
+        (cover, video)
+    }
+
     #[test]
-    fn converts_a_wav_to_opus_mkv_and_copies_junk() {
+    fn converts_audio_and_video_to_opus_m4a() {
         let Some(bundle) = test_bundle() else {
             return;
         };
-        let root = std::env::temp_dir().join(format!("opus-convert-smoke-{}", std::process::id()));
+        let keep = std::env::var_os("OPUS_CONVERT_KEEP_TEST").is_some();
+        let root = std::env::temp_dir().join("opus-convert-smoke");
         let input = root.join("in");
         let album = input.join("Album");
+        let solo = input.join("Solo");
         let output = root.join("out");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&album).unwrap();
-        let wav = album.join("Tone.wav");
-        let junk = album.join("notes.txt");
-        fs::write(&junk, "cover notes").unwrap();
-        let jpeg = album.join("Tone.jpg");
-        let jpeg_status = Command::new(&bundle.ffmpeg)
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=red:s=64x64:d=1",
-                "-frames:v",
-                "1",
-            ])
-            .arg(&jpeg)
-            .status()
-            .expect("jpeg");
-        assert!(jpeg_status.success());
-        let status = Command::new(&bundle.ffmpeg)
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=1",
-                "-c:a",
-                "pcm_s16le",
-            ])
-            .arg(&wav)
-            .status()
-            .expect("ffmpeg");
-        assert!(status.success());
-        let shared = Shared::new();
+        fs::create_dir_all(&solo).unwrap();
+        fs::write(album.join("notes.txt"), "cover notes").unwrap();
+        // Sizes tell the pictures apart: embedded 300, folder cover 200,
+        // sidecar 120, a frame of the video would be 640.
+        let blue = root.join("blue.jpg");
+        let green = root.join("green.png");
+        ff(&bundle, &["-f", "lavfi", "-i", "color=c=blue:s=300x300:d=1", "-frames:v", "1"], &blue);
+        ff(&bundle, &["-f", "lavfi", "-i", "color=c=green:s=300x300:d=1", "-frames:v", "1"], &green);
+        ff(&bundle, &["-f", "lavfi", "-i", "color=c=yellow:s=200x200:d=1", "-frames:v", "1"], &album.join("cover.jpg"));
+        ff(&bundle, &["-f", "lavfi", "-i", "color=c=red:s=120x120:d=1", "-frames:v", "1"], &solo.join("Clip.jpg"));
+        let blue_s = blue.display().to_string();
+        let green_s = green.display().to_string();
+        ff(&bundle, &["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-i", &blue_s,
+            "-map", "0:a", "-map", "1:v", "-c:a", "libmp3lame", "-b:a", "192k", "-c:v", "copy",
+            "-id3v2_version", "3", "-disposition:v", "attached_pic",
+            "-metadata", "title=MP3 Song", "-metadata", "artist=Artist A; Artist B",
+            "-metadata", "album=Test Album", "-metadata", "album_artist=Album Artist",
+            "-metadata", "track=3/12", "-metadata", "disc=1/2", "-metadata", "date=2024",
+            "-metadata", "genre=Techno", "-metadata", "comment=mp3 comment", "-metadata", "composer=Comp"],
+            &album.join("Mp3.mp3"));
+        ff(&bundle, &["-f", "lavfi", "-i", "sine=frequency=550:duration=2", "-i", &green_s,
+            "-map", "0:a", "-map", "1:v", "-c:a", "flac", "-c:v", "copy", "-disposition:v", "attached_pic",
+            "-metadata", "TITLE=FLAC Song", "-metadata", "ARTIST=Flac Artist", "-metadata", "ALBUM=Test Album",
+            "-metadata", "ALBUMARTIST=Album Artist", "-metadata", "TRACKNUMBER=4", "-metadata", "DISCNUMBER=1",
+            "-metadata", "DATE=2023-05-01", "-metadata", "GENRE=Jazz", "-metadata", "COMMENT=flac comment"],
+            &album.join("Flac.flac"));
+        ff(&bundle, &["-f", "lavfi", "-i", "sine=frequency=660:duration=2", "-c:a", "pcm_s16le",
+            "-metadata", "title=WAV Song", "-metadata", "artist=Wav Artist"], &album.join("Wav.wav"));
+        ff(&bundle, &["-f", "lavfi", "-i", "sine=frequency=770:duration=2", "-c:a", "libopus", "-b:a", "96k",
+            "-metadata", "title=Opus Song", "-metadata", "artist=Opus Artist", "-metadata", "album=Test Album",
+            "-metadata", "track=5", "-metadata", "date=2022", "-metadata", "genre=Music"], &album.join("Opus.opus"));
+        ff(&bundle, &["-f", "lavfi", "-i", "testsrc=s=640x360:d=2:r=25", "-f", "lavfi", "-i", "sine=frequency=330:duration=2",
+            "-i", &blue_s, "-map", "0:v", "-map", "1:a", "-map", "2:v", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
+            "-metadata", "title=Video With Cover", "-metadata", "artist=Vid Artist", "-metadata", "album=Vid Album",
+            "-metadata", "date=2021"], &album.join("Video.mp4"));
+        ff(&bundle, &["-f", "lavfi", "-i", "testsrc=s=640x360:d=2:r=25", "-f", "lavfi", "-i", "sine=frequency=220:duration=2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-metadata", "title=Video No Cover", "-metadata", "artist=Vid Artist 2"], &solo.join("Clip.mp4"));
+
         let opts = Options {
             input: input.display().to_string(),
             output: output.display().to_string(),
             ..Options::default()
         };
+        let shared = Shared::new();
         crate::scan::scan(shared.clone(), bundle.ffprobe.clone(), opts.clone());
         let groups = shared.groups.lock().unwrap().take().unwrap();
-        assert!(groups.iter().any(|group| group.items.iter().any(|item| item.stem == "Tone")));
         let shared = Shared::new();
-        convert(shared.clone(), bundle.ffmpeg, bundle.ffprobe.clone(), opts, groups);
-        let mkv = output.join("Album").join("Tone.mkv");
-        let copied = output.join("Album").join("notes.txt");
-        assert!(mkv.is_file(), "missing {}", mkv.display());
-        assert_eq!(fs::read_to_string(&copied).unwrap(), "cover notes");
-        let info = crate::probe::probe(&bundle.ffprobe, &mkv).unwrap();
-        assert_eq!(info.codec, "opus");
-        assert!(info.has_cover, "mkv is missing the cover.jpg attachment");
-        assert!(!info.has_video, "cover must not become a video stream");
-        let _ = fs::remove_dir_all(&root);
+        convert(shared.clone(), bundle.ffmpeg.clone(), bundle.ffprobe.clone(), opts, groups);
+        assert_eq!(
+            fs::read_to_string(output.join("Album").join("notes.txt")).unwrap(),
+            "cover notes"
+        );
+
+        // (file, cover width, title, artist)
+        let expect: [(&str, i64, &str, &str); 6] = [
+            ("Album/Mp3.m4a", 300, "MP3 Song", "Artist A; Artist B"),
+            ("Album/Flac.m4a", 300, "FLAC Song", "Flac Artist"),
+            ("Album/Wav.m4a", 200, "WAV Song", "Wav Artist"),
+            ("Album/Opus.m4a", 200, "Opus Song", "Opus Artist"),
+            ("Album/Video.m4a", 300, "Video With Cover", "Vid Artist"),
+            ("Solo/Clip.m4a", 120, "Video No Cover", "Vid Artist 2"),
+        ];
+        for (name, width, title, artist) in expect {
+            let file = out_file(&output, name);
+            assert!(file.is_file(), "missing {}", file.display());
+            let info = crate::probe::probe(&bundle.ffprobe, &file).unwrap();
+            assert_eq!(info.codec, "opus", "{name}");
+            assert!(info.has_cover, "{name} has no cover");
+            assert_eq!(info.kind, crate::model::Kind::Audio, "{name} still has video");
+            assert_eq!(info.title, title, "{name}");
+            assert_eq!(info.artists.join("; "), artist, "{name}");
+            assert_eq!(cover_and_video(&bundle, &file), (Some(width), 0), "{name}");
+            let tags = format_tags(&bundle, &file);
+            assert_eq!(tags["major_brand"], "isom", "{name}");
+        }
+        let mp3 = format_tags(&bundle, &output.join("Album").join("Mp3.m4a"));
+        for (key, value) in [("album", "Test Album"), ("album_artist", "Album Artist"), ("track", "3/12"),
+            ("disc", "1/2"), ("date", "2024"), ("genre", "Techno"), ("comment", "mp3 comment"), ("composer", "Comp")] {
+            assert_eq!(mp3[key], value, "mp3 {key}");
+        }
+        let flac = format_tags(&bundle, &output.join("Album").join("Flac.m4a"));
+        for (key, value) in [("album", "Test Album"), ("album_artist", "Album Artist"), ("track", "4"),
+            ("disc", "1"), ("date", "2023-05-01"), ("genre", "Jazz"), ("comment", "flac comment")] {
+            assert_eq!(flac[key], value, "flac {key}");
+        }
+        let opus = format_tags(&bundle, &output.join("Album").join("Opus.m4a"));
+        for (key, value) in [("album", "Test Album"), ("track", "5"), ("date", "2022"), ("genre", "Music")] {
+            assert_eq!(opus[key], value, "opus {key}");
+        }
+        let video = format_tags(&bundle, &output.join("Album").join("Video.m4a"));
+        // Album is the folder album the app writes for the whole group.
+        assert_eq!(video["album"], "Test Album");
+        assert_eq!(video["date"], "2021");
+
+        // The genre write keeps the other tags and the cover.
+        let shared = Shared::new();
+        for (name, width, title, _) in expect {
+            let file = out_file(&output, name);
+            write_genre(&shared, &bundle.ffmpeg, &file, "Electronic").unwrap();
+            let info = crate::probe::probe(&bundle.ffprobe, &file).unwrap();
+            assert_eq!(info.genre, "Electronic", "{name}");
+            assert_eq!(info.title, title, "{name}");
+            assert_eq!(info.codec, "opus", "{name}");
+            assert_eq!(cover_and_video(&bundle, &file), (Some(width), 0), "{name} after genre");
+        }
+        let mp3 = format_tags(&bundle, &output.join("Album").join("Mp3.m4a"));
+        assert_eq!(mp3["track"], "3/12");
+        assert_eq!(mp3["album_artist"], "Album Artist");
+
+        // A second run keeps the finished files.
+        assert!(skip_existing(&bundle.ffprobe, &crate::model::Item {
+            source: album.join("Wav.wav"),
+            stem: "Wav".into(),
+            original_stem: "Wav".into(),
+            extension: "wav".into(),
+            meta_title: String::new(),
+            original_title: String::new(),
+            artists: Vec::new(),
+            original_artists: Vec::new(),
+            kind: crate::model::Kind::Audio,
+            size: 1,
+            duration: 2.0,
+            bitrate_kbps: None,
+            codec: "pcm_s16le".into(),
+            is_opus: false,
+            is_lossless: true,
+            has_video: false,
+            attached_pic: false,
+            track_number: None,
+            opus_kbps: Some(192),
+        }, &output.join("Album").join("Wav.m4a")));
+        if !keep {
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }

@@ -17,7 +17,7 @@ Tested with FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), Python `3.7.9`
 
 | Project | License | Notes |
 | --- | --- | --- |
-| [FFmpeg](https://ffmpeg.org/) | LGPL / GPL, depending on the build | Encode, remux, attach covers, write genre tags. A Gyan full build (`--enable-gpl --enable-version3`) is GPL-3.0. Tested with `ffmpeg version 2026-09-10-git-fd7c73d01e-full_build` from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/). |
+| [FFmpeg](https://ffmpeg.org/) | LGPL / GPL, depending on the build | Encode, remux, embed covers, write genre tags. A Gyan full build (`--enable-gpl --enable-version3`) is GPL-3.0. Tested with `ffmpeg version 2026-09-10-git-fd7c73d01e-full_build` from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/). |
 
 FFmpeg is a trademark of Fabrice Bellard / the FFmpeg project.
 

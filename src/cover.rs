@@ -1,5 +1,4 @@
-//! Still images for Matroska. MKV does not use MP4 attached_pic;
-//! the cover is an attached file named cover.jpg.
+//! Cover picture for the .m4a output, stored there as an attached picture.
 
 use std::fs::File;
 use std::io::Read;
@@ -87,20 +86,24 @@ fn jpeg(ffmpeg: &Path, source: &Path, work_dir: &Path) -> Option<Cover> {
         ".cover-{}.jpg",
         source.file_stem().unwrap_or_default().to_string_lossy()
     ));
-    if encode_jpeg(ffmpeg, source, &dest) {
+    if encode_jpeg(ffmpeg, source, None, &dest) {
         Some(Cover { path: dest, temp: true })
     } else {
         let _ = std::fs::remove_file(&dest);
         None
     }
 }
+
+/// The attached picture only. A plain `-i video` would grab a frame of the
+/// video itself, so the stream is picked by its attached_pic disposition.
+const ATTACHED_PIC: &str = "0:v:disp:attached_pic:0";
 
 fn extract(ffmpeg: &Path, source: &Path, work_dir: &Path) -> Option<Cover> {
     let dest = work_dir.join(format!(
         ".cover-{}.jpg",
         source.file_stem().unwrap_or_default().to_string_lossy()
     ));
-    if encode_jpeg(ffmpeg, source, &dest) {
+    if encode_jpeg(ffmpeg, source, Some(ATTACHED_PIC), &dest) {
         Some(Cover { path: dest, temp: true })
     } else {
         let _ = std::fs::remove_file(&dest);
@@ -108,7 +111,7 @@ fn extract(ffmpeg: &Path, source: &Path, work_dir: &Path) -> Option<Cover> {
     }
 }
 
-fn encode_jpeg(ffmpeg: &Path, source: &Path, dest: &Path) -> bool {
+fn encode_jpeg(ffmpeg: &Path, source: &Path, map: Option<&str>, dest: &Path) -> bool {
     let mut command = Command::new(ffmpeg);
     command
         .args([
@@ -118,7 +121,11 @@ fn encode_jpeg(ffmpeg: &Path, source: &Path, dest: &Path) -> bool {
             "error",
             "-i",
         ])
-        .arg(source)
+        .arg(source);
+    if let Some(map) = map {
+        command.args(["-map", map]);
+    }
+    command
         .args(["-an", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "2"])
         .arg(dest)
         .stdin(Stdio::null())

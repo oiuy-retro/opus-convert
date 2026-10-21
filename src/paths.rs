@@ -137,7 +137,7 @@ pub fn output_dir(output: &Path, rel: &str, map: &HashMap<String, String>) -> Pa
 pub fn output_name(item: &Item, opts: &Options) -> (String, String) {
     let stem = sanitize(&item.stem);
     if opts.converts(item.kind) && item.kind != Kind::Junk {
-        (stem, "mkv".into())
+        (stem, "m4a".into())
     } else {
         let ext = item.extension.trim_start_matches('.').to_string();
         (stem, ext)

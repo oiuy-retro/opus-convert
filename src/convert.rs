@@ -27,11 +27,13 @@ pub fn ffmpeg_args(
         "-i".into(),
         source.display().to_string(),
     ];
-    if item.kind == Kind::Video {
-        args.extend(["-map".into(), "0:v?".into(), "-c:v".into(), "copy".into()]);
-        args.extend(["-map".into(), "0:s?".into(), "-c:s".into(), "copy".into()]);
+    if let Some(cover) = cover {
+        args.extend(["-i".into(), cover.display().to_string()]);
     }
-    args.extend(["-map".into(), "0:a?".into()]);
+    // Output is audio only. Video files keep their first audio track (the one
+    // the bitrate was picked from); their video and subtitles are dropped.
+    let audio = if item.kind == Kind::Video { "0:a:0?" } else { "0:a?" };
+    args.extend(["-map".into(), audio.into()]);
     if item.is_opus || item.opus_kbps.is_none() {
         args.extend(["-c:a".into(), "copy".into()]);
     } else {
@@ -49,7 +51,24 @@ pub fn ffmpeg_args(
             "audio".into(),
         ]);
     }
-    args.extend(["-map_metadata".into(), "0".into()]);
+    if cover.is_some() {
+        args.extend([
+            "-map".into(),
+            "1:v:0".into(),
+            "-c:v".into(),
+            "copy".into(),
+            "-disposition:v:0".into(),
+            "attached_pic".into(),
+        ]);
+    }
+    // MP4 keeps only file-level tags. Ogg/Opus sources keep theirs on the
+    // audio stream, so pull those in too; file-level tags win.
+    args.extend([
+        "-map_metadata".into(),
+        "0:s:a:0".into(),
+        "-map_metadata".into(),
+        "0".into(),
+    ]);
     if !title.is_empty() {
         args.extend(["-metadata".into(), format!("title={title}")]);
     }
@@ -60,19 +79,7 @@ pub fn ffmpeg_args(
     if !album.is_empty() {
         args.extend(["-metadata".into(), format!("album={album}")]);
     }
-    if let Some(track) = item.track_number {
-        args.extend(["-metadata".into(), format!("track={track}")]);
-    }
-    if let Some(cover) = cover {
-        args.extend([
-            "-attach".into(),
-            cover.display().to_string(),
-            "-metadata:s:t:0".into(),
-            "mimetype=image/jpeg".into(),
-            "-metadata:s:t:0".into(),
-            "filename=cover.jpg".into(),
-        ]);
-    }
+    args.extend(["-f".into(), "mp4".into()]);
     args.push("-progress".into());
     args.push("pipe:1".into());
     args.push("-nostats".into());
@@ -81,7 +88,7 @@ pub fn ffmpeg_args(
 }
 
 pub fn genre_args(source: &Path, dest: &Path, genre: &str) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-y".into(),
         "-i".into(),
@@ -94,8 +101,19 @@ pub fn genre_args(source: &Path, dest: &Path, genre: &str) -> Vec<String> {
         "0".into(),
         "-metadata".into(),
         format!("genre={genre}"),
-        dest.display().to_string(),
-    ]
+    ];
+    // ffmpeg picks the iPod muxer for .m4a, which cannot hold Opus.
+    if is_m4a(dest) {
+        args.extend(["-f".into(), "mp4".into()]);
+    }
+    args.push(dest.display().to_string());
+    args
+}
+
+fn is_m4a(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("m4a"))
+        .unwrap_or(false)
 }
 
 pub fn parse_out_time(line: &str) -> Option<f64> {
@@ -154,11 +172,15 @@ mod tests {
         }
     }
 
+    fn pair(args: &[String], a: &str, b: &str) -> bool {
+        args.windows(2).any(|w| w[0] == a && w[1] == b)
+    }
+
     #[test]
     fn encode_args_set_libopus_and_tags() {
         let args = ffmpeg_args(
             Path::new("in.mp3"),
-            Path::new("out.mkv"),
+            Path::new("out.m4a"),
             &item(Kind::Audio, false, Some(128)),
             "Song",
             &["Queen".into()],
@@ -170,32 +192,61 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "title=Song"));
         assert!(args.iter().any(|arg| arg == "artist=Queen"));
         assert!(args.iter().any(|arg| arg == "album=News"));
+        assert!(pair(&args, "-f", "mp4"));
+        assert!(pair(&args, "-map", "0:a?"));
         assert!(!args.iter().any(|arg| arg == "attached_pic"));
         assert!(!args.iter().any(|arg| arg == "-attach"));
+        assert!(!args.iter().any(|arg| arg.starts_with("track=")), "track comes from the source tags");
     }
 
     #[test]
-    fn mkv_cover_is_an_attachment_named_cover_jpg() {
+    fn m4a_cover_is_an_attached_picture() {
         let args = ffmpeg_args(
             Path::new("in.mp3"),
-            Path::new("out.mkv"),
+            Path::new("out.m4a"),
             &item(Kind::Audio, false, Some(128)),
             "Song",
             &[],
             "",
             Some(Path::new(r"C:\tmp\art.jpg")),
         );
-        assert!(args.windows(2).any(|pair| pair[0] == "-attach" && pair[1].ends_with("art.jpg")));
-        assert!(args.iter().any(|arg| arg == "filename=cover.jpg"));
-        assert!(args.iter().any(|arg| arg == "mimetype=image/jpeg"));
-        assert!(!args.iter().any(|arg| arg == "attached_pic"));
+        assert!(pair(&args, "-i", r"C:\tmp\art.jpg"));
+        assert!(pair(&args, "-map", "1:v:0"));
+        assert!(pair(&args, "-c:v", "copy"));
+        assert!(pair(&args, "-disposition:v:0", "attached_pic"));
+        assert!(!args.iter().any(|arg| arg == "-attach"));
+    }
+
+    #[test]
+    fn video_keeps_only_the_first_audio_track() {
+        let args = ffmpeg_args(
+            Path::new("in.mp4"),
+            Path::new("out.m4a"),
+            &item(Kind::Video, false, Some(128)),
+            "Song",
+            &[],
+            "",
+            None,
+        );
+        assert!(pair(&args, "-map", "0:a:0?"));
+        assert!(!args.iter().any(|arg| arg == "0:v?" || arg == "0:s?"));
+        assert!(!pair(&args, "-c:v", "copy"));
+    }
+
+    #[test]
+    fn genre_write_forces_mp4_for_m4a_only() {
+        let m4a = genre_args(Path::new("a.m4a"), Path::new("a.genre-partial.m4a"), "Jazz");
+        assert!(pair(&m4a, "-f", "mp4"));
+        assert!(m4a.iter().any(|arg| arg == "genre=Jazz"));
+        let mp3 = genre_args(Path::new("a.mp3"), Path::new("a.genre-partial.mp3"), "Jazz");
+        assert!(!mp3.iter().any(|arg| arg == "-f"));
     }
 
     #[test]
     fn already_opus_is_copied() {
         let args = ffmpeg_args(
             Path::new("in.opus"),
-            Path::new("out.mkv"),
+            Path::new("out.m4a"),
             &item(Kind::Audio, true, None),
             "Song",
             &[],
