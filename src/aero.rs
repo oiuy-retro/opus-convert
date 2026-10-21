@@ -533,6 +533,24 @@ unsafe fn thick_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> L
         paint_combo_face(hwnd);
         return result;
     }
+    // The native combo repaints its box straight away (not via WM_PAINT) on
+    // focus, clicks, keys and selection changes, so paint the 3.0 box again.
+    if combo
+        && matches!(
+            msg,
+            WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | 0x0102 | 0x0215 | WM_ENABLE
+                | 0x014E | 0x000C
+        )
+    {
+        let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        paint_combo_face(hwnd);
+        return result;
+    }
+    if combo && msg == WM_MOUSEMOVE && windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd {
+        let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        paint_combo_face(hwnd);
+        return result;
+    }
     if msg == WM_PAINT && edit && !IsWindowEnabled(hwnd).as_bool() {
         paint_disabled_edit(hwnd);
         return LRESULT(0);
@@ -696,7 +714,9 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
             ..Default::default()
         };
         if GetComboBoxInfo(hwnd, &mut info).is_ok() {
-            let h = info.rcItem.bottom.max(info.rcButton.bottom);
+            // The native frame is as thick below the text/button as above it,
+            // so the whole closed box is bottom + top (not just bottom).
+            let h = (info.rcItem.bottom + info.rcItem.top).max(info.rcButton.bottom + info.rcButton.top);
             if (9..=96).contains(&h) {
                 return h;
             }
@@ -720,37 +740,182 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows 3.0 drop-down list ("combo box").
+//
+// Windows 2.03 had no combo box, so the user picked the Windows 3.0 one.
+// Measured from real Windows 3.0 screenshots (Control Panel > International,
+// Desktop, Color; Task List and Fonts list boxes):
+// * the field is white with a 1px black border;
+// * the arrow button sits at the right end, sharing that black border. Inside
+//   the border it is 15x17: 2px white highlight on the top/left, 2px dark gray
+//   (128,128,128) shadow on the right/bottom with 45-degree corners, light
+//   gray (192,192,192) face, and a black down arrow with an underline bar;
+// * when the box has the focus the text is shown highlighted: black with white
+//   text, 1px of white inside the border;
+// * the opened list is a plain 3.0 list box: white, 1px black border, the
+//   selected item black with white text.
+// Each 3.0 pixel becomes a `combo_unit` square so it stays crisp at high DPI.
+// ---------------------------------------------------------------------------
+
+/// Inner width of the 3.0 arrow button (between the black lines), in 3.0 pixels.
+pub const COMBO_BTN_INNER: i32 = 15;
+const GRAY: (u8, u8, u8) = (128, 128, 128);
+const SILVER: (u8, u8, u8) = (192, 192, 192);
+
+/// The 3.0 down arrow with its underline bar: 7 wide, 9 tall ('#' = black).
+pub const GLYPH_COMBO_ARROW: [&str; 9] = [
+    "..###..",
+    "..###..",
+    "..###..",
+    "#######",
+    ".#####.",
+    "..###..",
+    "...#...",
+    ".......",
+    "#######",
+];
+
+/// Pixel scale for the 3.0 combo art: 1 at 96 DPI, 2 at 192 DPI, ...
+pub fn combo_unit(dpi: i32) -> i32 {
+    ((dpi + 24) / 96).max(1)
+}
+
+fn window_dpi(hwnd: HWND) -> i32 {
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("user32.dll")) else {
+            return 96;
+        };
+        let Some(proc) = GetProcAddress(lib, windows::core::s!("GetDpiForWindow")) else {
+            return 96;
+        };
+        type GetDpi = unsafe extern "system" fn(HWND) -> u32;
+        let get: GetDpi = std::mem::transmute(proc);
+        let dpi = get(hwnd) as i32;
+        if dpi <= 0 { 96 } else { dpi }
+    }
+}
+
+/// Colour of one pixel of the 3.0 button bevel inside its black outline.
+/// `w` x `h` is the inner size in 3.0 pixels (15x17 in Windows 3.0 itself).
+/// `pressed` draws the button pushed in: a 1px gray shadow top/left, no highlight.
+pub fn combo_bevel_pixel(x: i32, y: i32, w: i32, h: i32, pressed: bool) -> (u8, u8, u8) {
+    if pressed {
+        return if x == 0 || y == 0 { GRAY } else { SILVER };
+    }
+    // Shadow: bottom two rows and right two columns, cut at 45 degrees where
+    // they meet the highlight (top-right and bottom-left corners).
+    let right = x >= w - 2 && !(y == 0 && x == w - 2);
+    let bottom = y >= h - 2 && !(x == 0 && y == h - 2);
+    if right || bottom {
+        return GRAY;
+    }
+    if x < 2 || y < 2 {
+        return WHITE;
+    }
+    SILVER
+}
+
+/// Where the arrow glyph's top-left lands inside the button (3.0 pixels).
+pub fn combo_glyph_origin(w: i32, h: i32, pressed: bool) -> (i32, i32) {
+    let off = if pressed { 1 } else { 0 };
+    ((w - 7) / 2 + off, (h - 9) / 2 + off)
+}
+
+fn paint_combo_button(dc: HDC, r: RECT, u: i32, pressed: bool) {
+    // Black outline, one 3.0 pixel thick (the left line divides it from the field).
+    thick_box(dc, r, u);
+    let inner = inset(r, u);
+    let w = ((inner.right - inner.left) / u).max(9);
+    let h = ((inner.bottom - inner.top) / u).max(11);
+    // Any remainder pixels at high DPI go to the face colour (centre).
+    fill3(dc, inner, SILVER);
+    let ox = inner.left + ((inner.right - inner.left) - w * u) / 2;
+    let oy = inner.top + ((inner.bottom - inner.top) - h * u) / 2;
+    let px = |x: i32, y: i32, c: (u8, u8, u8)| {
+        fill3(dc, RECT { left: ox + x * u, top: oy + y * u, right: ox + (x + 1) * u, bottom: oy + (y + 1) * u }, c);
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let c = combo_bevel_pixel(x, y, w, h, pressed);
+            if c != SILVER {
+                px(x, y, c);
+            }
+        }
+    }
+    let (gx, gy) = combo_glyph_origin(w, h, pressed);
+    for (row, line) in GLYPH_COMBO_ARROW.iter().enumerate() {
+        for (col, ch) in line.bytes().enumerate() {
+            if ch == b'#' {
+                px(gx + col as i32, gy + row as i32, BLACK);
+            }
+        }
+    }
+}
+
+/// Height the closed box is painted at: the clip region set by the UI if any,
+/// otherwise what the control reports.
+fn combo_painted_height(hwnd: HWND) -> i32 {
+    unsafe {
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        let mut h = 0;
+        if GetWindowRgn(hwnd, rgn).0 != 0 {
+            let mut boxr = RECT::default();
+            if GetRgnBox(rgn, &mut boxr).0 != 0 {
+                h = boxr.bottom - boxr.top;
+            }
+        }
+        let _ = DeleteObject(rgn);
+        if (9..=96).contains(&h) {
+            return h;
+        }
+    }
+    combo_face_height(hwnd).max(22)
+}
+
+/// True while the arrow button is held down (the control's own pressed state,
+/// STATE_SYSTEM_PRESSED), so the button pops back up once the mouse is released.
+fn combo_pressed(hwnd: HWND) -> bool {
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        GetComboBoxInfo(hwnd, &mut info).is_ok() && info.stateButton.0 & 0x8 != 0
+    }
+}
+
 fn paint_combo_face(hwnd: HWND) {
     unsafe {
         let dc = GetWindowDC(hwnd);
         let mut wr = RECT::default();
         let _ = GetWindowRect(hwnd, &mut wr);
+        let u = combo_unit(window_dpi(hwnd));
         let w = wr.right - wr.left;
-        let h = combo_face_height(hwnd).max(22);
+        let h = combo_painted_height(hwnd);
         let face = RECT { left: 0, top: 0, right: w, bottom: h };
         fill3(dc, face, WHITE);
-        black_box(dc, face);
-        let aw = h.max(16);
-        let btn = RECT { left: w - aw, top: 0, right: w, bottom: h };
-        fill3(dc, btn, WHITE);
-        black_box(dc, btn);
-        arrow(
-            dc,
-            (btn.left + btn.right) / 2,
-            (btn.top + btn.bottom) / 2,
-            (aw / 2 - 3).max(4),
-            1,
-            BLACK,
-        );
-        let mut buf = [0u16; 128];
+        thick_box(dc, face, u);
+        // 15 inner pixels plus the black line on each side.
+        let bw = (COMBO_BTN_INNER + 2) * u;
+        let btn = RECT { left: w - bw, top: 0, right: w, bottom: h };
+        paint_combo_button(dc, btn, u, combo_pressed(hwnd));
+        let enabled = IsWindowEnabled(hwnd).as_bool();
+        let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
+        let mut buf = [0u16; 256];
         let len = GetWindowTextW(hwnd, &mut buf);
+        let hl = RECT { left: 2 * u, top: 2 * u, right: btn.left - u, bottom: h - 2 * u };
+        let selected = focused && enabled && len > 0;
+        if selected {
+            fill3(dc, hl, BLACK);
+        }
         if len > 0 {
             let text = String::from_utf16_lossy(&buf[..len as usize]);
             let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
             let old = if !font.0.is_null() { SelectObject(dc, font) } else { std::mem::zeroed() };
-            let mut tr = RECT { left: 8, top: 0, right: btn.left - 4, bottom: h };
+            let mut tr = RECT { left: hl.left + 2 * u, top: hl.top, right: hl.right - u, bottom: hl.bottom };
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, rgb3(BLACK));
+            SetTextColor(dc, rgb3(if !enabled { GRAY } else if selected { WHITE } else { BLACK }));
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             let _ = DrawTextW(
                 dc,
@@ -766,6 +931,98 @@ fn paint_combo_face(hwnd: HWND) {
         }
         let _ = ReleaseDC(hwnd, dc);
     }
+}
+
+/// Owner-draw one item of a 3.0 drop-down list (WM_DRAWITEM from the combo's parent).
+/// Returns false when the message is not for one of our combo boxes.
+pub fn draw_combo_item(lparam: LPARAM) -> bool {
+    use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+    unsafe {
+        if lparam.0 == 0 {
+            return false;
+        }
+        let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+        if item.CtlType.0 != 3 {
+            return false;
+        }
+        // The closed box is painted by paint_combo_face.
+        if item.itemState.0 & 0x1000 != 0 {
+            return true;
+        }
+        let dc = item.hDC;
+        let r = item.rcItem;
+        let selected = item.itemState.0 & 0x1 != 0;
+        fill3(dc, r, if selected { BLACK } else { WHITE });
+        if item.itemID == u32::MAX {
+            return true;
+        }
+        let combo = item.hwndItem;
+        let n = SendMessageW(combo, 0x0149, WPARAM(item.itemID as usize), LPARAM(0)).0;
+        if n <= 0 {
+            return true;
+        }
+        let mut buf = vec![0u16; n as usize + 1];
+        let got = SendMessageW(combo, 0x0148, WPARAM(item.itemID as usize), LPARAM(buf.as_mut_ptr() as isize)).0;
+        if got <= 0 {
+            return true;
+        }
+        buf.truncate(got as usize);
+        let u = combo_unit(window_dpi(combo));
+        let font = HFONT(SendMessageW(combo, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let old = if !font.0.is_null() { SelectObject(dc, font) } else { std::mem::zeroed() };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, rgb3(if selected { WHITE } else { BLACK }));
+        let mut tr = RECT { left: r.left + 2 * u, top: r.top, right: r.right - u, bottom: r.bottom };
+        let _ = DrawTextW(
+            dc,
+            &mut buf,
+            &mut tr,
+            windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
+                DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
+            ),
+        );
+        if !font.0.is_null() {
+            SelectObject(dc, old);
+        }
+        true
+    }
+}
+
+/// Give the opened list (the ComboLBox popup) the 3.0 list-box frame:
+/// unthemed, 1px black border.
+pub fn style_combo_list(combo: HWND) {
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        if GetComboBoxInfo(combo, &mut info).is_err() || info.hwndList.0.is_null() {
+            return;
+        }
+        let list = info.hwndList;
+        let ours: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = list_proc;
+        if GetWindowLongPtrW(list, GWLP_WNDPROC) == ours as isize {
+            return;
+        }
+        untheme(list);
+        let old = GetWindowLongPtrW(list, GWLP_WNDPROC);
+        SetWindowLongPtrW(list, GWLP_USERDATA, old);
+        SetWindowLongPtrW(list, GWLP_WNDPROC, ours as isize);
+    }
+}
+
+unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let prev: windows::Win32::UI::WindowsAndMessaging::WNDPROC = std::mem::transmute(old);
+    let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+    if msg == WM_NCPAINT || msg == 0x0086 || msg == WM_SIZE || msg == 0x0047 {
+        let dc = GetWindowDC(hwnd);
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        frame_rect(dc, RECT { left: 0, top: 0, right: wr.right - wr.left, bottom: wr.bottom - wr.top }, rgb3(BLACK));
+        let _ = ReleaseDC(hwnd, dc);
+    }
+    result
 }
 
 unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1984,5 +2241,68 @@ mod tests {
         assert_eq!(bar_strip_width(21, 3, 1), 21);
         assert_eq!(bar_strip_width(34, 3, 2), 34);
         assert!(bar_strip_width(10, 3, 1) >= 17);
+    }
+
+    /// Inside of the arrow button of the Country box in a real Windows 3.0
+    /// Control Panel > International screenshot (GUIdebook), between the
+    /// black lines. '.' white, 's' (192,192,192), 'g' (128,128,128), '#' black.
+    const WIN30_COMBO_BUTTON: [&str; 17] = [
+        "..............g",
+        ".............gg",
+        "..sssssssssssgg",
+        "..sssssssssssgg",
+        "..ssss###ssssgg",
+        "..ssss###ssssgg",
+        "..ssss###ssssgg",
+        "..ss#######ssgg",
+        "..sss#####sssgg",
+        "..ssss###ssssgg",
+        "..sssss#sssssgg",
+        "..sssssssssssgg",
+        "..ss#######ssgg",
+        "..sssssssssssgg",
+        "..sssssssssssgg",
+        ".gggggggggggggg",
+        "ggggggggggggggg",
+    ];
+
+    #[test]
+    fn combo_button_matches_windows_30_pixel_for_pixel() {
+        let (w, h) = (COMBO_BTN_INNER, 17);
+        let (gx, gy) = combo_glyph_origin(w, h, false);
+        for (y, line) in WIN30_COMBO_BUTTON.iter().enumerate() {
+            let mut got = String::new();
+            for x in 0..w {
+                let (x, y) = (x, y as i32);
+                let in_glyph = x >= gx && y >= gy && x < gx + 7 && y < gy + 9
+                    && GLYPH_COMBO_ARROW[(y - gy) as usize].as_bytes()[(x - gx) as usize] == b'#';
+                got.push(if in_glyph {
+                    '#'
+                } else {
+                    match combo_bevel_pixel(x, y, w, h, false) {
+                        WHITE => '.',
+                        SILVER => 's',
+                        GRAY => 'g',
+                        _ => '?',
+                    }
+                });
+            }
+            assert_eq!(&got, line, "row {y}");
+        }
+    }
+
+    #[test]
+    fn combo_unit_scales_with_dpi() {
+        assert_eq!(combo_unit(96), 1);
+        assert_eq!(combo_unit(120), 1);
+        assert_eq!(combo_unit(144), 1);
+        assert_eq!(combo_unit(168), 2);
+        assert_eq!(combo_unit(192), 2);
+    }
+
+    #[test]
+    fn pressed_button_moves_glyph_down_right() {
+        assert_eq!(combo_glyph_origin(15, 17, true), (5, 5));
+        assert_eq!(combo_glyph_origin(15, 17, false), (4, 4));
     }
 }
