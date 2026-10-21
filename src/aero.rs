@@ -707,6 +707,9 @@ pub fn layout(window: RECT, dpi: i32, maximized: bool) -> Layout {
     let border = if maximized { 0 } else { scale(5, dpi) };
     let caption_h = scale(22, dpi);
     let btn = caption_h;
+    // Windows 2.03 title bar boxes are 25 pixels wide plus a 1-pixel black
+    // line between each box and the rest of the title bar.
+    let box_w = CAPTION_BOX_W * caption_unit(dpi);
     let gap = 0;
     let inner = RECT {
         left: window.left + border,
@@ -724,17 +727,17 @@ pub fn layout(window: RECT, dpi: i32, maximized: bool) -> Layout {
     let close = RECT {
         left: caption.left + gap,
         top: by,
-        right: caption.left + gap + btn,
+        right: caption.left + gap + box_w,
         bottom: by + btn,
     };
     let max = RECT {
-        left: caption.right - gap - btn,
+        left: caption.right - gap - box_w,
         top: by,
         right: caption.right - gap,
         bottom: by + btn,
     };
     let min = RECT {
-        left: max.left - gap - btn,
+        left: max.left - gap - box_w,
         top: by,
         right: max.left - gap,
         bottom: by + btn,
@@ -872,35 +875,168 @@ fn text_left(hdc: HDC, font: HFONT, r: RECT, s: &str, color: (u8, u8, u8)) {
     }
 }
 
-pub fn caption_button(hdc: HDC, r: RECT, kind: CapBtn, _hover: bool, press: bool, _active: bool) {
-    if press {
-        fill3(hdc, r, BLACK);
-    } else {
-        fill3(hdc, r, WHITE);
-    }
-    black_box(hdc, r);
-    let ink = if press { WHITE } else { BLACK };
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
-    let half = ((r.right - r.left) / 2 - 4).max(4);
+/// Box width in Windows 2.03 pixels, counting the 1-pixel black line that
+/// separates the box from the title.
+pub const CAPTION_BOX_W: i32 = 26;
+
+/// Windows 2.03 pixel size for title bar boxes: 1 up to 150%, then 2, 3...
+pub fn caption_unit(dpi: i32) -> i32 {
+    ((dpi + 24) / 96).max(1)
+}
+
+// Title bar box faces measured from Windows 2.03 screenshots: each box is
+// 25 x 19 white pixels; '#' is black. The arrows are outlined with a black
+// shadow on the right and bottom edges.
+const GLYPH_W: i32 = 25;
+const GLYPH_H: i32 = 19;
+
+/// System-menu box (top left). In this app it closes the window.
+pub const GLYPH_SYSTEM: [&str; 19] = [
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    "..####################...",
+    "..#..................##..",
+    "..#..................##..",
+    "..#####################..",
+    "...####################..",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+    ".........................",
+];
+
+/// Minimize box: down arrow.
+pub const GLYPH_MIN: [&str; 19] = [
+    ".........................",
+    ".........................",
+    "..........#####..........",
+    "..........#...#..........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    ".......####...####.......",
+    "........#.......###......",
+    ".........#.....###.......",
+    "..........#...###........",
+    "...........#.###.........",
+    "............###..........",
+    ".............#...........",
+    ".........................",
+    ".........................",
+];
+
+/// Maximize box: up arrow.
+pub const GLYPH_MAX: [&str; 19] = [
+    ".........................",
+    ".........................",
+    "............#............",
+    "...........#.##..........",
+    "..........#...##.........",
+    ".........#.....##........",
+    "........#.......##.......",
+    ".......####...#####......",
+    "..........#...####.......",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........#...##.........",
+    "..........######.........",
+    "...........#####.........",
+    ".........................",
+    ".........................",
+];
+
+/// Restore box, shown in place of maximize while maximized: down and up
+/// arrows side by side.
+pub const GLYPH_RESTORE: [&str; 19] = [
+    ".........................",
+    ".........................",
+    ".....#####......#........",
+    ".....#...##....#.##......",
+    ".....#...##...#...##.....",
+    ".....#...##..#.....##....",
+    ".....#...##.#.......##...",
+    ".....#...######...#####..",
+    ".....#...##...#...####...",
+    ".....#...##...#...##.....",
+    "..####...######...##.....",
+    "...#.......####...##.....",
+    "....#.....###.#...##.....",
+    ".....#...###..#...##.....",
+    "......#.###...#...##.....",
+    ".......###....######.....",
+    "........#......#####.....",
+    ".........................",
+    ".........................",
+];
+
+pub fn caption_glyph(kind: CapBtn) -> &'static [&'static str; 19] {
     match kind {
-        CapBtn::Close => {
-            fill(
-                hdc,
-                RECT {
-                    left: r.left + 4,
-                    top: cy - 1,
-                    right: r.right - 4,
-                    bottom: cy + 2,
-                },
-                rgb3(ink),
-            );
-        }
-        CapBtn::Min => arrow(hdc, cx, cy, half, 1, ink),
-        CapBtn::Max => arrow(hdc, cx, cy, half, -1, ink),
-        CapBtn::Restore => {
-            arrow(hdc, cx - 2, cy + 2, half - 1, 1, ink);
-            arrow(hdc, cx + 2, cy - 2, half - 1, -1, ink);
+        CapBtn::Close => &GLYPH_SYSTEM,
+        CapBtn::Min => &GLYPH_MIN,
+        CapBtn::Max => &GLYPH_MAX,
+        CapBtn::Restore => &GLYPH_RESTORE,
+    }
+}
+
+/// One Windows 2.03 title bar box. `r` includes the separator line: on the
+/// right for the system box, on the left for minimize and maximize. The
+/// title bar's bottom line (the last row of `r`) is left alone. A pressed
+/// box is drawn inverted.
+pub fn caption_button(hdc: HDC, r: RECT, kind: CapBtn, _hover: bool, press: bool, _active: bool) {
+    let u = ((r.right - r.left) / CAPTION_BOX_W).max(1);
+    let line = if kind == CapBtn::Close {
+        RECT { left: r.right - u, top: r.top, right: r.right, bottom: r.bottom - 1 }
+    } else {
+        RECT { left: r.left, top: r.top, right: r.left + u, bottom: r.bottom - 1 }
+    };
+    let face = if kind == CapBtn::Close {
+        RECT { left: r.left, top: r.top, right: r.right - u, bottom: r.bottom - 1 }
+    } else {
+        RECT { left: r.left + u, top: r.top, right: r.right, bottom: r.bottom - 1 }
+    };
+    let (back, ink) = if press { (BLACK, WHITE) } else { (WHITE, BLACK) };
+    fill3(hdc, face, back);
+    fill3(hdc, line, BLACK);
+    let glyph = caption_glyph(kind);
+    let gx = face.left + ((face.right - face.left) - GLYPH_W * u) / 2;
+    let gy = face.top + ((face.bottom - face.top) - GLYPH_H * u) / 2;
+    for (row, bits) in glyph.iter().enumerate() {
+        let y = gy + row as i32 * u;
+        let mut col = 0i32;
+        let bytes = bits.as_bytes();
+        while (col as usize) < bytes.len() {
+            if bytes[col as usize] != b'#' {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            while (col as usize) < bytes.len() && bytes[col as usize] == b'#' {
+                col += 1;
+            }
+            let run = RECT { left: gx + start * u, top: y, right: gx + col * u, bottom: y + u };
+            let clipped = RECT {
+                left: run.left.max(face.left),
+                top: run.top.max(face.top),
+                right: run.right.min(face.right),
+                bottom: run.bottom.min(face.bottom),
+            };
+            if clipped.right > clipped.left && clipped.bottom > clipped.top {
+                fill3(hdc, clipped, ink);
+            }
         }
     }
 }
@@ -1318,5 +1454,26 @@ mod tests {
         let b = rgb(255, 255, 255);
         assert_eq!(mix(a, b, 0.0), a);
         assert_eq!(mix(a, b, 1.0), b);
+    }
+
+    #[test]
+    fn caption_glyphs_are_25_by_19() {
+        for kind in [CapBtn::Close, CapBtn::Min, CapBtn::Max, CapBtn::Restore] {
+            let glyph = caption_glyph(kind);
+            assert_eq!(glyph.len() as i32, GLYPH_H);
+            assert!(glyph.iter().all(|row| row.len() as i32 == GLYPH_W && row.chars().all(|c| c == '#' || c == '.')));
+        }
+    }
+
+    #[test]
+    fn title_bar_boxes_are_windows_203_width() {
+        let l = layout(RECT { left: 0, top: 0, right: 640, bottom: 480 }, 96, false);
+        assert_eq!(l.btn_close.right - l.btn_close.left, 26);
+        assert_eq!(l.btn_max.right - l.btn_max.left, 26);
+        assert_eq!(l.btn_min.right, l.btn_max.left);
+        assert_eq!(l.btn_max.right, l.caption.right);
+        assert_eq!(l.btn_close.left, l.caption.left);
+        let big = layout(RECT { left: 0, top: 0, right: 1280, bottom: 960 }, 192, false);
+        assert_eq!(big.btn_max.right - big.btn_max.left, 52);
     }
 }
