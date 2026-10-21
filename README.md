@@ -3,25 +3,8 @@
 Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
 A built copy is in [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`) in the same folder as the program.
-
-## Verify the download
-
-SHA-256 of [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe):
-
-```text
-42fe55dbc004eeb62d6b27f725724715ed9a0661fa8ec242ac37e8a3b18d7464
 ```
-
-The same hash is in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt). The `Opus.Convert.exe` download on the [v1.0.0 release](https://github.com/oiuy-retro/opus-convert/releases/tag/v1.0.0) is an earlier build; its SHA-256 is `c729281e36b56642bf212ba63932d51cb06373a9a53d683c5289a4c2f8b397d4`. To check a copy on Windows, run this in PowerShell from the repository folder and compare the hash:
-
-```powershell
-Get-FileHash ".\dist\Opus Convert.exe" -Algorithm SHA256
-```
-
-Or, from Command Prompt:
-
-```bat
-certutil -hashfile "dist\Opus Convert.exe" SHA256
+sha256: 42fe55dbc004eeb62d6b27f725724715ed9a0661fa8ec242ac37e8a3b18d7464
 ```
 
 ## What it does
