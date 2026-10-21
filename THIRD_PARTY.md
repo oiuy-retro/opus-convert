@@ -2,6 +2,8 @@
 
 Opus Convert links against or is meant to run next to the following projects. This repository ships the Opus Convert sources and a built `dist/Opus Convert.exe`. It does not ship FFmpeg, Python, or musicnn weights.
 
+Tested with FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), Python `3.7.9`, and musicnn `0.1.0`.
+
 ## Rust crates (linked into the exe)
 
 | Project | License | Use |
