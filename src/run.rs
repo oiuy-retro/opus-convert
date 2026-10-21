@@ -1,0 +1,985 @@
+//! Scan the tree, then copy or convert each file.
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use crate::convert;
+use crate::cover;
+use crate::genre;
+use crate::model::{Group, Item, Kind, Options};
+use crate::paths;
+use crate::probe;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    Queued,
+    Active,
+    Waiting,
+    Pinned,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkRow {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub copied: u64,
+    pub fraction: f64,
+    pub kind: RowKind,
+    pub note: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Live {
+    pub status: String,
+    pub rows: Vec<WorkRow>,
+    pub banked_bytes: u64,
+    pub current_bytes: u64,
+    pub ok: u32,
+    pub bad: u32,
+    pub total: u32,
+    pub lastfm_done: u32,
+    pub lastfm_total: u32,
+    pub musicnn_done: u32,
+    pub musicnn_total: u32,
+    pub done: bool,
+    pub error: String,
+}
+
+impl Live {
+    pub fn new() -> Self {
+        Self {
+            status: String::new(),
+            rows: Vec::new(),
+            banked_bytes: 0,
+            current_bytes: 0,
+            ok: 0,
+            bad: 0,
+            total: 0,
+            lastfm_done: 0,
+            lastfm_total: 0,
+            musicnn_done: 0,
+            musicnn_total: 0,
+            done: false,
+            error: String::new(),
+        }
+    }
+}
+
+pub struct Shared {
+    pub live: Mutex<Live>,
+    pub groups: Mutex<Option<Vec<Group>>>,
+    pub child: Mutex<Option<Child>>,
+    pub cancel: AtomicBool,
+}
+
+impl Shared {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            live: Mutex::new(Live::new()),
+            groups: Mutex::new(None),
+            child: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+        })
+    }
+}
+
+struct RunOut {
+    code: i32,
+    log: String,
+}
+
+pub fn reset(shared: &Shared) {
+    shared.cancel.store(false, Ordering::Relaxed);
+    *shared.groups.lock().expect("groups") = None;
+    *shared.live.lock().expect("live") = Live::new();
+}
+
+pub fn set_status(shared: &Shared, text: &str) {
+    shared.live.lock().expect("live").status = text.to_string();
+}
+
+pub fn finish(shared: &Shared, groups: Vec<Group>, error: String) {
+    let mut live = shared.live.lock().expect("live");
+    live.done = true;
+    live.status = if error.is_empty() {
+        if shared.cancel.load(Ordering::Relaxed) {
+            "Stopped.".into()
+        } else {
+            "Done.".into()
+        }
+    } else {
+        error.clone()
+    };
+    if !error.is_empty() {
+        live.error = error;
+    }
+    *shared.groups.lock().expect("groups") = Some(groups);
+}
+
+pub fn kill_child(shared: &Shared) {
+    shared.cancel.store(true, Ordering::Relaxed);
+    if let Ok(mut slot) = shared.child.lock() {
+        if let Some(child) = slot.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
+pub fn convert(shared: Arc<Shared>, ffmpeg: PathBuf, ffprobe: PathBuf, opts: Options, groups: Vec<Group>) {
+    reset(&shared);
+    let output = PathBuf::from(opts.output.trim());
+    if let Err(err) = fs::create_dir_all(paths::extended(&output)) {
+        finish(&shared, groups, format!("Could not create the output folder: {err}"));
+        return;
+    }
+    let map = paths::folder_map(&groups);
+    let (rows, jobs) = rows_for(&groups);
+    {
+        let mut live = shared.live.lock().expect("live");
+        live.total = jobs;
+        live.rows = rows;
+    }
+    let mut ready: Vec<ReadyFile> = Vec::new();
+    for group in &groups {
+        let dir = paths::output_dir(&output, &group.rel, &map);
+        let _ = fs::create_dir_all(paths::extended(&dir));
+    }
+    for group_index in 0..groups.len() {
+        if cancelled(&shared) {
+            finish(&shared, groups, String::new());
+            return;
+        }
+        let dir = paths::output_dir(&output, &groups[group_index].rel, &map);
+        let junk = groups[group_index].junk.clone();
+        for file in junk {
+            if cancelled(&shared) {
+                finish(&shared, groups, String::new());
+                return;
+            }
+            let row_id = row_id(&file.source);
+            set_kind(&shared, row_id, RowKind::Active, "");
+            set_status(&shared, &file.name);
+            let dest = dir.join(&file.name);
+            match copy_file(&shared, row_id, &file.source, &dest, file.size) {
+                Ok(()) => remove_done(&shared, row_id, file.size),
+                Err(err) => fail(&shared, row_id, &err),
+            }
+        }
+        let count = groups[group_index].items.len();
+        for item_index in 0..count {
+            if cancelled(&shared) {
+                finish(&shared, groups, String::new());
+                return;
+            }
+            let item = groups[group_index].items[item_index].clone();
+            let album = groups[group_index].album.clone();
+            let row_id = row_id(&item.source);
+            set_kind(&shared, row_id, RowKind::Active, "");
+            set_status(&shared, &item.stem);
+            let (stem, extension) = paths::output_name(&item, &opts);
+            let dest = paths::unique_path(&dir, &stem, &extension);
+            if convert::copy_media(&item, &opts) {
+                match copy_file(&shared, row_id, &item.source, &dest, item.size) {
+                    Ok(()) => {
+                        remember(&mut ready, &item, dest, item.size);
+                        remove_done(&shared, row_id, item.size);
+                    }
+                    Err(err) => fail(&shared, row_id, &err),
+                }
+                continue;
+            }
+            match convert_one(&shared, &ffmpeg, &ffprobe, &item, &dest, &album) {
+                Ok(size) => {
+                    remember(&mut ready, &item, dest, size);
+                    remove_done(&shared, row_id, size);
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(paths::extended(&dest));
+                    let fallback = fallback_path(&dir, &item);
+                    match copy_file(&shared, row_id, &item.source, &fallback, item.size) {
+                        Ok(()) => {
+                            remember(&mut ready, &item, fallback, item.size);
+                            pin(&shared, row_id, &format!("Copied the original. {err}"));
+                        }
+                        Err(_) => fail(&shared, row_id, &err),
+                    }
+                }
+            }
+        }
+    }
+    if opts.lookup_genre && !cancelled(&shared) {
+        lookup_genres(&shared, &ffmpeg, &ffprobe, ready, opts.genre_policy);
+    }
+    finish(&shared, groups, String::new());
+}
+
+#[derive(Clone)]
+struct ReadyFile {
+    dest: PathBuf,
+    name: String,
+    size: u64,
+    clear_if_missing: bool,
+}
+
+fn remember(ready: &mut Vec<ReadyFile>, item: &Item, dest: PathBuf, size: u64) {
+    if item.kind == Kind::Junk {
+        return;
+    }
+    ready.push(ReadyFile {
+        dest,
+        name: item.stem.clone(),
+        size,
+        clear_if_missing: false,
+    });
+}
+
+fn convert_one(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    item: &Item,
+    dest: &Path,
+    album: &str,
+) -> Result<u64, String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(paths::extended(parent)).map_err(|err| err.to_string())?;
+    }
+    if skip_existing(ffprobe, item, dest) {
+        set_fraction(shared, row_id(&item.source), 1.0);
+        return Ok(fs::metadata(paths::extended(dest)).map(|meta| meta.len()).unwrap_or(0));
+    }
+    let work_dir = dest.parent().unwrap_or(Path::new("."));
+    let cover = cover::prepare(ffmpeg, item, work_dir);
+    let cover_path = cover.as_ref().map(|cover| cover.path.clone());
+    let partial = dest.with_extension("partial.mkv");
+    let _ = fs::remove_file(paths::extended(&partial));
+    let args = convert::ffmpeg_args(
+        &item.source,
+        &partial,
+        item,
+        &item.meta_title,
+        &item.artists,
+        album,
+        cover_path.as_deref(),
+    );
+    let row_id = row_id(&item.source);
+    let duration = item.duration;
+    let shared_progress = Arc::clone(shared);
+    let result = run_command(shared, ffmpeg, &args, move |line| {
+        if let Some(seconds) = convert::parse_out_time(line) {
+            if duration > 0.0 {
+                set_fraction(&shared_progress, row_id, (seconds / duration).clamp(0.0, 0.99));
+            }
+        }
+    });
+    if let Some(cover) = cover {
+        cover.cleanup();
+    }
+    match result {
+        Ok(output) if output.code == 0 && file_len(&partial) > 0 => {
+            if dest.exists() {
+                let _ = fs::remove_file(paths::extended(dest));
+            }
+            fs::rename(paths::extended(&partial), paths::extended(dest)).map_err(|err| err.to_string())?;
+            set_fraction(shared, row_id, 1.0);
+            Ok(file_len(dest))
+        }
+        Ok(output) => {
+            let _ = fs::remove_file(paths::extended(&partial));
+            Err(tail(&output.log))
+        }
+        Err(err) => {
+            let _ = fs::remove_file(paths::extended(&partial));
+            Err(err)
+        }
+    }
+}
+
+fn skip_existing(ffprobe: &Path, item: &Item, dest: &Path) -> bool {
+    if !dest.is_file() {
+        return false;
+    }
+    let Ok(info) = probe::probe(ffprobe, dest) else {
+        let _ = fs::remove_file(paths::extended(dest));
+        return false;
+    };
+    if info.duration <= 0.0 {
+        let _ = fs::remove_file(paths::extended(dest));
+        return false;
+    }
+    if item.duration > 1.0 && info.duration < item.duration * 0.90 {
+        let _ = fs::remove_file(paths::extended(dest));
+        return false;
+    }
+    let wants_cover = item.attached_pic || cover::sidecar(item).is_some();
+    if wants_cover && !info.has_cover {
+        let _ = fs::remove_file(paths::extended(dest));
+        return false;
+    }
+    true
+}
+
+fn fallback_path(dir: &Path, item: &Item) -> PathBuf {
+    paths::unique_path(dir, &paths::sanitize(&item.stem), &item.extension)
+}
+
+fn filter_genre_files(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    files: Vec<ReadyFile>,
+    policy: crate::model::GenrePolicy,
+) -> Option<Vec<ReadyFile>> {
+    let mut lookup = Vec::new();
+    for mut file in files {
+        if cancelled(shared) {
+            return None;
+        }
+        match classify_genre(shared, ffmpeg, ffprobe, &mut file, policy) {
+            Ok(true) => lookup.push(file),
+            Ok(false) => {}
+            Err(err) => fail(shared, row_id(&file.dest), &err),
+        }
+    }
+    Some(lookup)
+}
+
+fn classify_genre(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    file: &mut ReadyFile,
+    policy: crate::model::GenrePolicy,
+) -> Result<bool, String> {
+    let info = probe::probe(ffprobe, &file.dest)?;
+    match genre::plan_for_file(policy, info.kind, &info.genre) {
+        genre::ExistingGenre::Skip => Ok(false),
+        genre::ExistingGenre::Write(cleaned) => {
+            write_genre(shared, ffmpeg, &file.dest, &cleaned)?;
+            Ok(false)
+        }
+        genre::ExistingGenre::Lookup => {
+            file.clear_if_missing = false;
+            Ok(true)
+        }
+        genre::ExistingGenre::LookupOrClear => {
+            file.clear_if_missing = true;
+            Ok(true)
+        }
+    }
+}
+
+fn lookup_genres(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    files: Vec<ReadyFile>,
+    policy: crate::model::GenrePolicy,
+) {
+    let key = genre::api_key();
+    let python = crate::genre::python_next_to_exe();
+    let script = crate::genre::script_next_to_exe();
+    let files = match filter_genre_files(shared, ffmpeg, ffprobe, files, policy) {
+        Some(files) => files,
+        None => return,
+    };
+    {
+        let mut live = shared.live.lock().expect("live");
+        live.lastfm_total = if key.trim().is_empty() {
+            0
+        } else {
+            files.len() as u32
+        };
+        live.lastfm_done = 0;
+        live.musicnn_total = 0;
+        live.musicnn_done = 0;
+        live.rows = files
+            .iter()
+            .map(|file| WorkRow {
+                id: row_id(&file.dest),
+                name: file.name.clone(),
+                size: file.size,
+                copied: 0,
+                fraction: 0.0,
+                kind: RowKind::Queued,
+                note: String::new(),
+            })
+            .collect();
+    }
+    let leftover = if key.trim().is_empty() {
+        files
+    } else {
+        let mut leftover = Vec::new();
+        for file in &files {
+            if cancelled(shared) {
+                return;
+            }
+            let row_id = row_id(&file.dest);
+            set_kind(shared, row_id, RowKind::Active, "");
+            set_status(shared, &format!("Last.fm  {}", file.name));
+            let matched = match lastfm_one(shared, ffmpeg, ffprobe, file, &key) {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(err) => {
+                    fail(shared, row_id, &err);
+                    bump_lastfm(shared);
+                    leftover.push(file.clone());
+                    continue;
+                }
+            };
+            bump_lastfm(shared);
+            if matched {
+                remove_done(shared, row_id, file.size);
+            } else {
+                leftover.push(file.clone());
+                set_kind(shared, row_id, RowKind::Queued, "");
+            }
+            sleep_cancel(shared, genre::lastfm_delay());
+        }
+        leftover
+    };
+    {
+        let mut live = shared.live.lock().expect("live");
+        live.musicnn_total = leftover.len() as u32;
+        live.rows = leftover
+            .iter()
+            .map(|file| WorkRow {
+                id: row_id(&file.dest),
+                name: file.name.clone(),
+                size: file.size,
+                copied: 0,
+                fraction: 0.0,
+                kind: RowKind::Queued,
+                note: String::new(),
+            })
+            .collect();
+    }
+    if leftover.is_empty() {
+        return;
+    }
+    let (python, script) = match (python, script) {
+        (Ok(python), Ok(script)) => (python, script),
+        (Err(err), _) | (_, Err(err)) => {
+            set_status(shared, &err);
+            for file in leftover {
+                fail(shared, row_id(&file.dest), &err);
+                bump_musicnn(shared);
+            }
+            return;
+        }
+    };
+    set_status(shared, "Loading musicnn...");
+    let mut child = match genre::prepare_musicnn(&python, &script).spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let err = format!("Could not start musicnn: {err}");
+            set_status(shared, &err);
+            for file in leftover {
+                fail(shared, row_id(&file.dest), &err);
+                bump_musicnn(shared);
+            }
+            return;
+        }
+    };
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            fail_musicnn_all(shared, leftover, "musicnn has no input pipe.");
+            return;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            fail_musicnn_all(shared, leftover, "musicnn has no output pipe.");
+            return;
+        }
+    };
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let mut log = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut log);
+        });
+    }
+    *shared.child.lock().expect("child") = Some(child);
+    let mut reader = BufReader::new(stdout);
+    let mut stopped: Option<String> = None;
+    for file in leftover {
+        if cancelled(shared) {
+            drop(stdin);
+            if let Some(mut child) = shared.child.lock().expect("child").take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return;
+        }
+        let row_id = row_id(&file.dest);
+        if let Some(err) = stopped.as_ref() {
+            fail(shared, row_id, err);
+            bump_musicnn(shared);
+            continue;
+        }
+        set_kind(shared, row_id, RowKind::Active, "");
+        set_status(shared, &format!("musicnn  {}", file.name));
+        let path = file.dest.to_string_lossy();
+        if writeln!(stdin, "{path}").is_err() || stdin.flush().is_err() {
+            stopped = Some("musicnn stopped.".to_string());
+            fail(shared, row_id, stopped.as_ref().unwrap());
+            bump_musicnn(shared);
+            continue;
+        }
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                stopped = Some("musicnn stopped.".to_string());
+                fail(shared, row_id, stopped.as_ref().unwrap());
+                bump_musicnn(shared);
+                continue;
+            }
+            Ok(_) => {}
+        }
+        match apply_musicnn_line(shared, ffmpeg, &file, row_id, &line) {
+            Ok(()) => {}
+            Err(err) => fail(shared, row_id, &err),
+        }
+        bump_musicnn(shared);
+    }
+    drop(stdin);
+    if let Some(mut child) = shared.child.lock().expect("child").take() {
+        let _ = child.wait();
+    }
+}
+
+fn fail_musicnn_all(shared: &Arc<Shared>, leftover: Vec<ReadyFile>, err: &str) {
+    set_status(shared, err);
+    for file in leftover {
+        fail(shared, row_id(&file.dest), err);
+        bump_musicnn(shared);
+    }
+}
+
+fn apply_musicnn_line(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    file: &ReadyFile,
+    row_id: u64,
+    line: &str,
+) -> Result<(), String> {
+    let genres = genre::genres_from_musicnn(line)?;
+    if genres.is_empty() {
+        if file.clear_if_missing {
+            write_genre(shared, ffmpeg, &file.dest, "")?;
+        }
+        set_kind(shared, row_id, RowKind::Pinned, "No genre");
+        bump_ok(shared);
+        return Ok(());
+    }
+    write_genre(shared, ffmpeg, &file.dest, &genre::join_genres(&genres))?;
+    remove_done(shared, row_id, file.size);
+    Ok(())
+}
+
+fn lastfm_one(
+    shared: &Arc<Shared>,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    file: &ReadyFile,
+    key: &str,
+) -> Result<bool, String> {
+    let info = probe::probe(ffprobe, &file.dest)?;
+    let artist = info.artists.first().cloned().unwrap_or_default();
+    let title = info.title;
+    let Some(genres) = genre::lastfm_genres(&artist, &title, key)? else {
+        return Ok(false);
+    };
+    if genres.is_empty() {
+        return Ok(false);
+    }
+    write_genre(shared, ffmpeg, &file.dest, &genre::join_genres(&genres))?;
+    Ok(true)
+}
+
+fn write_genre(shared: &Arc<Shared>, ffmpeg: &Path, dest: &Path, genre: &str) -> Result<(), String> {
+    let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = dest.extension().map(|ext| ext.to_string_lossy().to_string()).unwrap_or_else(|| "mkv".into());
+    let partial = dest.with_file_name(format!("{stem}.genre-partial.{ext}"));
+    let args = convert::genre_args(dest, &partial, genre);
+    let parked = shared.child.lock().expect("child").take();
+    let result = run_command(shared, ffmpeg, &args, |_| {});
+    *shared.child.lock().expect("child") = parked;
+    match result {
+        Ok(output) if output.code == 0 && file_len(&partial) > 0 => {
+            let _ = fs::remove_file(paths::extended(dest));
+            fs::rename(paths::extended(&partial), paths::extended(dest)).map_err(|err| err.to_string())?;
+            Ok(())
+        }
+        Ok(output) => {
+            let _ = fs::remove_file(paths::extended(&partial));
+            Err(tail(&output.log))
+        }
+        Err(err) => {
+            let _ = fs::remove_file(paths::extended(&partial));
+            Err(err)
+        }
+    }
+}
+
+fn bump_lastfm(shared: &Shared) {
+    let mut live = shared.live.lock().expect("live");
+    live.lastfm_done = live.lastfm_done.saturating_add(1);
+}
+
+fn bump_musicnn(shared: &Shared) {
+    let mut live = shared.live.lock().expect("live");
+    live.musicnn_done = live.musicnn_done.saturating_add(1);
+}
+
+fn bump_ok(shared: &Shared) {
+    let mut live = shared.live.lock().expect("live");
+    live.ok = live.ok.saturating_add(1);
+}
+
+fn sleep_cancel(shared: &Shared, total: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < total {
+        if cancelled(shared) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn copy_file(shared: &Shared, row_id: u64, source: &Path, dest: &Path, size: u64) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(paths::extended(parent)).map_err(|err| err.to_string())?;
+    }
+    if source == dest {
+        set_fraction(shared, row_id, 1.0);
+        return Ok(());
+    }
+    let mut input = fs::File::open(paths::extended(source)).map_err(|err| err.to_string())?;
+    let mut output = fs::File::create(paths::extended(dest)).map_err(|err| err.to_string())?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied = 0u64;
+    loop {
+        if cancelled(shared) {
+            drop(output);
+            let _ = fs::remove_file(paths::extended(dest));
+            return Err("Stopped.".into());
+        }
+        let n = input.read(&mut buf).map_err(|err| err.to_string())?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n]).map_err(|err| err.to_string())?;
+        copied += n as u64;
+        {
+            let mut live = shared.live.lock().expect("live");
+            live.current_bytes = copied;
+            if let Some(row) = live.rows.iter_mut().find(|row| row.id == row_id) {
+                row.copied = copied;
+                row.size = size.max(copied);
+                row.fraction = if size > 0 {
+                    (copied as f64 / size as f64).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+            }
+        }
+    }
+    output.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn rows_for(groups: &[Group]) -> (Vec<WorkRow>, u32) {
+    let mut rows = Vec::new();
+    for group in groups {
+        for file in &group.junk {
+            rows.push(WorkRow {
+                id: row_id(&file.source),
+                name: file.name.clone(),
+                size: file.size,
+                copied: 0,
+                fraction: 0.0,
+                kind: RowKind::Queued,
+                note: String::new(),
+            });
+        }
+        for item in &group.items {
+            rows.push(WorkRow {
+                id: row_id(&item.source),
+                name: format!("{}.{}", item.stem, item.extension),
+                size: item.size,
+                copied: 0,
+                fraction: 0.0,
+                kind: RowKind::Queued,
+                note: String::new(),
+            });
+        }
+    }
+    let jobs = rows.len() as u32;
+    (rows, jobs)
+}
+
+fn row_id(path: &Path) -> u64 {
+    let mut value = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.to_string_lossy().bytes() {
+        value ^= byte as u64;
+        value = value.wrapping_mul(0x100_0000_01b3);
+    }
+    value
+}
+
+fn set_kind(shared: &Shared, id: u64, kind: RowKind, note: &str) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(row) = live.rows.iter_mut().find(|row| row.id == id) {
+        row.kind = kind;
+        if !note.is_empty() {
+            row.note = note.to_string();
+        }
+    }
+}
+
+fn set_fraction(shared: &Shared, id: u64, fraction: f64) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(row) = live.rows.iter_mut().find(|row| row.id == id) {
+        row.fraction = fraction.clamp(0.0, 1.0);
+        live.current_bytes = (row.size as f64 * row.fraction) as u64;
+    }
+}
+
+fn remove_done(shared: &Shared, id: u64, size: u64) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(index) = live.rows.iter().position(|row| row.id == id) {
+        live.rows.remove(index);
+    }
+    live.ok = live.ok.saturating_add(1);
+    live.banked_bytes = live.banked_bytes.saturating_add(size);
+    live.current_bytes = 0;
+}
+
+fn fail(shared: &Shared, id: u64, message: &str) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(row) = live.rows.iter_mut().find(|row| row.id == id) {
+        row.kind = RowKind::Failed;
+        row.note = message.to_string();
+    }
+    live.bad = live.bad.saturating_add(1);
+    live.current_bytes = 0;
+}
+
+fn pin(shared: &Shared, id: u64, message: &str) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(row) = live.rows.iter_mut().find(|row| row.id == id) {
+        row.kind = RowKind::Pinned;
+        row.note = message.to_string();
+        let index = live.rows.iter().position(|row| row.id == id);
+        let insert = live.rows.iter().position(|row| row.kind != RowKind::Pinned).unwrap_or(live.rows.len());
+        if let Some(index) = index {
+            if index != insert && index > insert {
+                let row = live.rows.remove(index);
+                let insert = insert.min(live.rows.len());
+                live.rows.insert(insert, row);
+            }
+        }
+    }
+    live.ok = live.ok.saturating_add(1);
+    live.current_bytes = 0;
+}
+
+fn cancelled(shared: &Shared) -> bool {
+    shared.cancel.load(Ordering::Relaxed)
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(paths::extended(path)).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn tail(log: &str) -> String {
+    let line = log
+        .lines()
+        .rev()
+        .find(|line| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("out_time") && !t.starts_with("progress=") && !t.starts_with("bitrate=")
+        })
+        .unwrap_or("The conversion failed.");
+    line.trim().to_string()
+}
+
+fn run_command<F>(shared: &Shared, exe: &Path, args: &[String], on_line: F) -> Result<RunOut, String>
+where
+    F: FnMut(&str) + Send + 'static,
+{
+    if cancelled(shared) {
+        return Err("Stopped.".into());
+    }
+    let mut command = Command::new(exe);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Could not start {}: {err}", exe.display()))?;
+    let stdout = child.stdout.take().ok_or_else(|| "No output pipe.".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "No error pipe.".to_string())?;
+    *shared.child.lock().expect("child") = Some(child);
+    let log = Arc::new(Mutex::new(String::new()));
+    let log_out = log.clone();
+    let log_err = log.clone();
+    let callback = Arc::new(Mutex::new(on_line));
+    let callback_out = callback.clone();
+    let stdout_thread = thread::spawn(move || {
+        read_lines(stdout, move |line| {
+            callback_out.lock().expect("progress")(&line);
+            push_log(&log_out, &line);
+        });
+    });
+    let stderr_thread = thread::spawn(move || {
+        read_lines(stderr, move |line| {
+            push_log(&log_err, &line);
+        });
+    });
+    let status = shared
+        .child
+        .lock()
+        .expect("child")
+        .as_mut()
+        .and_then(|child| child.wait().ok());
+    *shared.child.lock().expect("child") = None;
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    if cancelled(shared) {
+        return Err("Stopped.".into());
+    }
+    let code = status.and_then(|status| status.code()).unwrap_or(1);
+    let log_text = log.lock().expect("log").clone();
+    Ok(RunOut { code, log: log_text })
+}
+
+fn read_lines<R, F>(reader: R, mut on_line: F)
+where
+    R: Read,
+    F: FnMut(String),
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => on_line(line.trim_end_matches(['\r', '\n']).to_string()),
+            Err(_) => break,
+        }
+    }
+}
+
+fn push_log(log: &Mutex<String>, line: &str) {
+    let mut text = log.lock().expect("log");
+    if text.len() < 256 * 1024 {
+        text.push_str(line);
+        text.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Options;
+    use crate::tools;
+
+    fn test_bundle() -> Option<crate::tools::Bundle> {
+        if let Ok(bundle) = tools::load_bundle() {
+            return Some(bundle);
+        }
+        let dir = PathBuf::from(r"C:\ffmpeg\bin");
+        let ffmpeg = dir.join("ffmpeg.exe");
+        let ffprobe = dir.join("ffprobe.exe");
+        if ffmpeg.is_file() && ffprobe.is_file() {
+            Some(crate::tools::Bundle { ffmpeg, ffprobe })
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn converts_a_wav_to_opus_mkv_and_copies_junk() {
+        let Some(bundle) = test_bundle() else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("opus-convert-smoke-{}", std::process::id()));
+        let input = root.join("in");
+        let album = input.join("Album");
+        let output = root.join("out");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&album).unwrap();
+        let wav = album.join("Tone.wav");
+        let junk = album.join("notes.txt");
+        fs::write(&junk, "cover notes").unwrap();
+        let jpeg = album.join("Tone.jpg");
+        let jpeg_status = Command::new(&bundle.ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x64:d=1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&jpeg)
+            .status()
+            .expect("jpeg");
+        assert!(jpeg_status.success());
+        let status = Command::new(&bundle.ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&wav)
+            .status()
+            .expect("ffmpeg");
+        assert!(status.success());
+        let shared = Shared::new();
+        let opts = Options {
+            input: input.display().to_string(),
+            output: output.display().to_string(),
+            ..Options::default()
+        };
+        crate::scan::scan(shared.clone(), bundle.ffprobe.clone(), opts.clone());
+        let groups = shared.groups.lock().unwrap().take().unwrap();
+        assert!(groups.iter().any(|group| group.items.iter().any(|item| item.stem == "Tone")));
+        let shared = Shared::new();
+        convert(shared.clone(), bundle.ffmpeg, bundle.ffprobe.clone(), opts, groups);
+        let mkv = output.join("Album").join("Tone.mkv");
+        let copied = output.join("Album").join("notes.txt");
+        assert!(mkv.is_file(), "missing {}", mkv.display());
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "cover notes");
+        let info = crate::probe::probe(&bundle.ffprobe, &mkv).unwrap();
+        assert_eq!(info.codec, "opus");
+        assert!(info.has_cover, "mkv is missing the cover.jpg attachment");
+        assert!(!info.has_video, "cover must not become a video stream");
+        let _ = fs::remove_dir_all(&root);
+    }
+}

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+lastfm.key
+__pycache__/
+*.pyc
+*.log
+.idea/
+.vscode/
