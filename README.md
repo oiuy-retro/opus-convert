@@ -8,7 +8,7 @@ A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/
 
 - Picks an input folder and an output folder, then walks every subfolder.
 - Encodes audio and video to Opus in Matroska. Video pictures are copied. Audio that is already Opus is remuxed, not re-encoded.
-- Copies junk files (covers, text, and anything that is not audio or video) as they are.
+- Copies every other file (cover images, text files, and anything else that isn't music or video) to the output folder unchanged.
 - Wizard pages: Options, Names, Titles, Metadata, Convert.
 - Profiles are stored in `%AppData%\Opus Convert\profiles.json`.
 
