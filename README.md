@@ -63,10 +63,6 @@ Video files are always looked up, whichever option you choose.
 3. Optional: `lastfm.key`, [`python.exe`](https://www.python.org/downloads/release/python-379/) (with [musicnn](https://github.com/jordipons/musicnn)), and `musicnn-one.py`.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
 
-Windows 10 or later. The window uses Windows 2.03 chrome (flat black frames, inverted caption, checkerboard dither) and the Explorer folder picker.
-
-Current look bugs (scrollbars and open dropdown lists) are listed in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
 ## Build
 
 This crate targets `x86_64-pc-windows-gnu` (`rust-toolchain.toml`).
