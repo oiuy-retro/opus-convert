@@ -2,7 +2,7 @@
 
 Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
-A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/releases/latest/download/Opus.Convert.exe) on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) in the same folder as the program.
+A built copy is [`Opus.Convert.exe`](https://github.com/oiuy-retro/opus-convert/releases/latest/download/Opus.Convert.exe) on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest).
 
 ## What it does
 
@@ -60,8 +60,9 @@ Video files are always looked up, whichever option you choose.
 
 1. Copy `Opus.Convert.exe` from the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest) to a folder.
 2. Place [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg.exe` and `ffprobe.exe` beside it.
-3. Optional: `lastfm.key`, [`python.exe`](https://www.python.org/downloads/release/python-379/) (with [musicnn](https://github.com/jordipons/musicnn)), and `musicnn-one.py`.
+3. For genre lookup, put [Python 3.7.9](https://www.python.org/downloads/release/python-379/) `python.exe` with [musicnn](https://github.com/jordipons/musicnn) installed (packages in [THIRD_PARTY.md](THIRD_PARTY.md)), plus `musicnn-one.py`, next to the exe.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
+5. For Last.fm genres, enter your API key in the **Last.fm key** field on the Options page.
 
 ## Build
 
