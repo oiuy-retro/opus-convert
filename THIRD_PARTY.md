@@ -19,7 +19,7 @@ Opus Convert links against or is meant to run next to the following projects. Th
 
 FFmpeg is a trademark of Fabrice Bellard / the FFmpeg project.
 
-## Optional genre lookup
+## Genre lookup
 
 | Project | License | Notes |
 | --- | --- | --- |

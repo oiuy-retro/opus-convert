@@ -44,7 +44,7 @@ When **Look up genre** is ticked, genre lookup runs after every file has been co
 
 Up to two genres are written per file.
 
-Enter your Last.fm API key in the **Last.fm key** field on the Options page. It's saved to `%AppData%\Opus Convert\lastfm.key`. You can also put it in `lastfm.key` next to the exe (see `lastfm.key.example`) or set `LASTFM_API_KEY`. Without a key, every file goes to musicnn.
+Enter your Last.fm API key in the **Last.fm key** field on the Options page. You can also put it in `lastfm.key` next to the exe (see `lastfm.key.example`) or set `LASTFM_API_KEY`. Without a key, every file goes to musicnn.
 
 musicnn needs [Python](https://www.python.org/downloads/release/python-379/) (`python.exe`) with the packages listed in [THIRD_PARTY.md](THIRD_PARTY.md), plus `musicnn-one.py`, next to the exe. With **Look up genre** ticked, Convert won't start if either is missing.
 
