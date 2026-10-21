@@ -26,7 +26,14 @@ On Options you choose the profile, folders, whether to convert audio and/or vide
 
 ## Cover art
 
-Album art is a Matroska attachment named `cover.jpg` (`image/jpeg`). Sources: an embedded still, then sidecar `Song.jpg`/`png`/`webp`, then `cover.*`, then `folder.*`. WebP and PNG are converted to JPEG first.
+Album art is saved inside each output file as `cover.jpg`. Opus Convert uses the first image it finds, in this order:
+
+1. An image with the same name as the song, like `Song.jpg`, `Song.jpeg`, `Song.png` or `Song.webp`
+2. `cover.jpg`, `cover.jpeg`, `cover.png` or `cover.webp` in the same folder
+3. `folder.jpg`, `folder.jpeg`, `folder.png` or `folder.webp` in the same folder
+4. Art already embedded in the source file
+
+PNG and WebP images are converted to JPEG.
 
 ## Genre lookup (optional)
 
