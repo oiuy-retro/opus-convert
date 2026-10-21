@@ -2,7 +2,7 @@
 //! (the pattern Windows 1.x/2.x used for gray on EGA/CGA).
 
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreatePatternBrush, CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Gdi::{
     GetWindowDC, GetWindowRgn, InvalidateRect, ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
     SetWindowRgn, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, HBRUSH, HDC, HFONT, HPEN, HRGN, NULL_BRUSH, PS_SOLID, TEXTMETRICW, TRANSPARENT,
+    GetDeviceCaps, LOGPIXELSX, MapWindowPoints, ScreenToClient, SetBkColor, SetBrushOrgEx,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{GetComboBoxInfo, COMBOBOXINFO, EM_SETMARGINS, PBM_SETPOS, PBM_SETRANGE32};
@@ -25,6 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOW_LONG_PTR_INDEX, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_ENABLE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCPAINT, WM_PAINT, WM_SETFOCUS, WM_SETFONT, WM_SIZE, WNDCLASSW,
+    CreateWindowExW, DestroyWindow, GetCursorPos, GetPropW, GetScrollInfo, RemovePropW, SetPropW, SetTimer,
+    GWLP_HINSTANCE, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SWP_HIDEWINDOW, SWP_SHOWWINDOW,
+    WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_MOUSEWHEEL, WM_NCDESTROY, WM_TIMER, WM_VSCROLL,
+    WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE, WS_VSCROLL,
 };
 
 pub const CLASS: &str = "OpusAeroBar";
@@ -142,11 +147,20 @@ pub fn scale(px: i32, dpi: i32) -> i32 {
     px * dpi / 96
 }
 
-pub fn scroll_width(dpi: i32) -> i32 {
-    scale(20, dpi)
+/// One Windows 2.03 screen pixel at this DPI. The scroll bars are drawn as
+/// pixel art, so they stay crisp: 1 at 100-150%, 2 at 175-250%, and so on.
+pub fn sb_unit(dpi: i32) -> i32 {
+    ((dpi + 24) / 96).max(1)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Width a scroll bar takes next to a black edge: a 1-pixel left line and a
+/// 13-pixel white face. Its right line is the black edge it sits against, so
+/// the whole bar measures 15 Windows 2.03 pixels, like the real one.
+pub fn scroll_width(dpi: i32) -> i32 {
+    14 * sb_unit(dpi)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SbHit {
     None,
     Up,
@@ -156,61 +170,216 @@ pub enum SbHit {
     PageDown,
 }
 
+impl SbHit {
+    fn code(self) -> isize {
+        match self {
+            SbHit::None => 0,
+            SbHit::Up => 1,
+            SbHit::Down => 2,
+            SbHit::Thumb => 3,
+            SbHit::PageUp => 4,
+            SbHit::PageDown => 5,
+        }
+    }
+
+    fn from_code(code: isize) -> SbHit {
+        match code {
+            1 => SbHit::Up,
+            2 => SbHit::Down,
+            3 => SbHit::Thumb,
+            4 => SbHit::PageUp,
+            5 => SbHit::PageDown,
+            _ => SbHit::None,
+        }
+    }
+}
+
+/// A vertical Windows 2.03 scroll bar. Every rect includes its 1-pixel black
+/// lines; neighbours share a line, as in the original.
+#[derive(Clone, Copy, Debug)]
 pub struct Scrollbar {
     pub up: RECT,
     pub down: RECT,
     pub track: RECT,
     pub thumb: RECT,
     pub body: RECT,
+    /// False when there is nothing to scroll or no room for the scroll box.
+    pub has_thumb: bool,
+    /// How far the scroll box can travel, in pixels.
+    pub travel: i32,
+    /// Largest scroll position.
+    pub max: i32,
+    pub unit: i32,
 }
 
+/// Scroll bar for `area` (outer lines included) when there is something to
+/// scroll and room for the scroll box; otherwise None.
 pub fn scrollbar(area: RECT, pos: i32, page: i32, content: i32, dpi: i32) -> Option<Scrollbar> {
-    if content <= page || area.right - area.left < 8 || area.bottom - area.top < scale(48, dpi) {
+    let u = sb_unit(dpi);
+    if content <= page || area.right - area.left < 8 || area.bottom - area.top < 48 * u {
         return None;
     }
-    let w = area.right - area.left;
-    let up = RECT { left: area.left, top: area.top, right: area.right, bottom: area.top + w };
-    let down = RECT { left: area.left, top: area.bottom - w, right: area.right, bottom: area.bottom };
-    let track = RECT { left: area.left, top: up.bottom, right: area.right, bottom: down.top };
-    let track_h = (track.bottom - track.top).max(1);
-    let max = (content - page).max(1);
-    let thumb_h = ((track_h as i64 * page as i64 / content.max(1) as i64) as i32).clamp(w, track_h);
-    let travel = (track_h - thumb_h).max(0);
-    let thumb_y = track.top + (travel as i64 * pos.clamp(0, max) as i64 / max as i64) as i32;
-    let thumb = RECT { left: area.left, top: thumb_y, right: area.right, bottom: thumb_y + thumb_h };
-    Some(Scrollbar { up, down, track, thumb, body: area })
+    Some(scrollbar_parts(area, pos, page, content, dpi))
+}
+
+/// Windows 2.03 geometry, measured from Windows 2.03 screenshots (in screen
+/// pixels): 15 wide with lines; arrow boxes 14 high inside their lines; the
+/// scroll box (thumb) is a fixed 16-high white box, not sized to the page.
+pub fn scrollbar_parts(area: RECT, pos: i32, page: i32, content: i32, dpi: i32) -> Scrollbar {
+    let u = sb_unit(dpi);
+    let h = (area.bottom - area.top).max(0);
+    let arrow_h = (16 * u).min(h / 2);
+    let up = RECT { left: area.left, top: area.top, right: area.right, bottom: area.top + arrow_h };
+    let down = RECT { left: area.left, top: area.bottom - arrow_h, right: area.right, bottom: area.bottom };
+    let track = RECT { left: area.left, top: up.bottom, right: area.right, bottom: down.top.max(up.bottom) };
+    let thumb_h = 18 * u;
+    // The scroll box shares its top line with the up box and its bottom line
+    // with the down box when it sits at either end.
+    let room = (down.top + u) - (up.bottom - u);
+    let max = (content - page).max(0);
+    let has_thumb = max > 0 && room >= thumb_h;
+    let travel = if has_thumb { room - thumb_h } else { 0 };
+    let thumb = if has_thumb {
+        let y = up.bottom - u + (travel as i64 * pos.clamp(0, max) as i64 / max.max(1) as i64) as i32;
+        RECT { left: area.left, top: y, right: area.right, bottom: y + thumb_h }
+    } else {
+        RECT { left: area.left, top: track.top, right: area.right, bottom: track.top }
+    };
+    Scrollbar { up, down, track, thumb, body: area, has_thumb, travel, max, unit: u }
+}
+
+/// Scroll position for a scroll box dragged `delta` pixels from `start`.
+pub fn drag_pos(sb: &Scrollbar, start: i32, delta: i32) -> i32 {
+    if sb.travel <= 0 || sb.max <= 0 {
+        return start.clamp(0, sb.max.max(0));
+    }
+    let start_px = start.clamp(0, sb.max) as i64 * sb.travel as i64 / sb.max as i64;
+    let px = (start_px + delta as i64).clamp(0, sb.travel as i64);
+    ((px * sb.max as i64 + sb.travel as i64 / 2) / sb.travel as i64) as i32
 }
 
 pub fn paint_scrollbar(hdc: HDC, sb: &Scrollbar) {
-    fill_dither(hdc, sb.body);
-    thick_box(hdc, sb.body, 2);
-    paint_arrow_box(hdc, sb.up, -1);
-    paint_arrow_box(hdc, sb.down, 1);
-    fill3(hdc, sb.thumb, WHITE);
-    thick_box(hdc, sb.thumb, 2);
+    paint_scrollbar_pressed(hdc, sb, SbHit::None);
 }
 
-fn paint_arrow_box(hdc: HDC, r: RECT, dir: i32) {
-    fill3(hdc, r, WHITE);
-    thick_box(hdc, r, 2);
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
-    arrow(hdc, cx, cy, ((r.right - r.left) / 2 - 4).max(4), dir, BLACK);
+pub fn paint_scrollbar_pressed(hdc: HDC, sb: &Scrollbar, pressed: SbHit) {
+    let u = sb.unit;
+    let b = sb.body;
+    if b.right - b.left <= 0 || b.bottom - b.top <= 0 {
+        return;
+    }
+    let black = rgb3(BLACK);
+    fill3(hdc, b, WHITE);
+    // Track: black with every fourth pixel white, rows offset by two pixels,
+    // exactly as Windows 2.03 drew the scroll bar background.
+    let track = RECT { left: b.left + u, top: sb.track.top, right: b.right - u, bottom: sb.track.bottom };
+    if track.bottom > track.top {
+        fill_scroll_track(hdc, track, b.left, b.top, u);
+    }
+    // Outer lines.
+    fill(hdc, RECT { left: b.left, top: b.top, right: b.right, bottom: b.top + u }, black);
+    fill(hdc, RECT { left: b.left, top: b.bottom - u, right: b.right, bottom: b.bottom }, black);
+    fill(hdc, RECT { left: b.left, top: b.top, right: b.left + u, bottom: b.bottom }, black);
+    fill(hdc, RECT { left: b.right - u, top: b.top, right: b.right, bottom: b.bottom }, black);
+    // Lines between the arrow boxes and the track.
+    fill(hdc, RECT { left: b.left, top: sb.up.bottom - u, right: b.right, bottom: sb.up.bottom }, black);
+    fill(hdc, RECT { left: b.left, top: sb.down.top, right: b.right, bottom: sb.down.top + u }, black);
+    paint_sb_arrow(hdc, sb.up, -1, u, pressed == SbHit::Up);
+    paint_sb_arrow(hdc, sb.down, 1, u, pressed == SbHit::Down);
+    if sb.has_thumb {
+        let t = sb.thumb;
+        fill3(hdc, RECT { left: b.left + u, top: t.top + u, right: b.right - u, bottom: t.bottom - u }, WHITE);
+        fill(hdc, RECT { left: b.left, top: t.top, right: b.right, bottom: t.top + u }, black);
+        fill(hdc, RECT { left: b.left, top: t.bottom - u, right: b.right, bottom: t.bottom }, black);
+    }
+}
+
+/// Pattern cell for the Windows 2.03 scroll bar track, `u` screen pixels per
+/// Windows 2.03 pixel: 4 wide, 2 high; true means white.
+pub fn track_pixel(col: i32, row: i32) -> bool {
+    (col + 2 * (row & 1)).rem_euclid(4) == 2
+}
+
+fn fill_scroll_track(hdc: HDC, r: RECT, org_x: i32, org_y: i32, u: i32) {
+    let w = 4 * u;
+    let h = 2 * u;
+    let stride = (((w + 15) / 16) * 2) as usize;
+    let mut bits = vec![0u8; stride * h as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if track_pixel(x / u, y / u) {
+                bits[y as usize * stride + (x / 8) as usize] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    unsafe {
+        let bmp = CreateBitmap(w, h, 1, 1, Some(bits.as_ptr() as *const _));
+        let brush = CreatePatternBrush(bmp);
+        // Monochrome pattern: 0 bits take the text colour, 1 bits the background.
+        let old_text = SetTextColor(hdc, rgb3(BLACK));
+        let old_back = SetBkColor(hdc, rgb3(WHITE));
+        let mut old_org = POINT::default();
+        let _ = SetBrushOrgEx(hdc, org_x.rem_euclid(w), org_y.rem_euclid(h), Some(&mut old_org));
+        let _ = FillRect(hdc, &r, brush);
+        let _ = SetBrushOrgEx(hdc, old_org.x, old_org.y, None);
+        SetBkColor(hdc, old_back);
+        SetTextColor(hdc, old_text);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(bmp);
+    }
+}
+
+/// White arrow box with the Windows 2.03 arrow: a 9-pixel-wide head, 5 rows
+/// tall, on a 3-pixel-wide shaft, 5 rows long. Pressed boxes are inverted.
+fn paint_sb_arrow(hdc: HDC, r: RECT, dir: i32, u: i32, pressed: bool) {
+    let face = RECT { left: r.left + u, top: r.top + u, right: r.right - u, bottom: r.bottom - u };
+    if face.right <= face.left || face.bottom <= face.top {
+        return;
+    }
+    let (back, ink) = if pressed { (BLACK, WHITE) } else { (WHITE, BLACK) };
+    fill3(hdc, face, back);
+    let cols = (face.right - face.left) / u;
+    let rows = (face.bottom - face.top) / u;
+    let gx = face.left + ((cols - 9).max(0) / 2) * u;
+    let gy = face.top + ((rows - 10).max(0) / 2) * u;
+    for row in 0..10 {
+        let (from, to) = arrow_row(row);
+        let y = if dir < 0 { gy + row * u } else { gy + (9 - row) * u };
+        if y + u > face.bottom || y < face.top {
+            continue;
+        }
+        fill3(
+            hdc,
+            RECT { left: gx + from * u, top: y, right: (gx + (to + 1) * u).min(face.right), bottom: y + u },
+            ink,
+        );
+    }
+}
+
+/// Columns (inclusive) lit on `row` of the up arrow glyph, tip first.
+pub fn arrow_row(row: i32) -> (i32, i32) {
+    if row < 5 {
+        (4 - row, 4 + row)
+    } else {
+        (3, 5)
+    }
 }
 
 pub fn scrollbar_hit(sb: &Scrollbar, p: POINT) -> SbHit {
-    if hit(sb.up, p) {
+    if !hit(sb.body, p) {
+        SbHit::None
+    } else if hit(sb.up, p) {
         SbHit::Up
     } else if hit(sb.down, p) {
         SbHit::Down
+    } else if !sb.has_thumb {
+        SbHit::None
     } else if hit(sb.thumb, p) {
         SbHit::Thumb
-    } else if hit(sb.track, p) && p.y < sb.thumb.top {
+    } else if p.y < sb.thumb.top {
         SbHit::PageUp
-    } else if hit(sb.track, p) {
-        SbHit::PageDown
     } else {
-        SbHit::None
+        SbHit::PageDown
     }
 }
 
@@ -257,6 +426,16 @@ pub fn register(instance: windows::Win32::Foundation::HINSTANCE) {
             ..Default::default()
         };
         let _ = RegisterClassW(&radio);
+        let scroll = WNDCLASSW {
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(scroll_proc),
+            hInstance: instance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: w!("OpusWin2Scroll"),
+            cbWndExtra: 40,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&scroll);
     }
 }
 
@@ -290,6 +469,9 @@ pub fn thicken(hwnd: HWND) {
         if class == "Edit" {
             pad_edit(hwnd);
         }
+        if wants_bar(hwnd, &class) {
+            attach_bar(hwnd);
+        }
         let _ = SetWindowPos(
             hwnd,
             HWND_TOP,
@@ -303,22 +485,42 @@ pub fn thicken(hwnd: HWND) {
 }
 
 unsafe extern "system" fn thick_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_DESTROY {
+        drop_bar(hwnd);
+    }
+    let result = thick_inner(hwnd, msg, wparam, lparam);
+    if msg != WM_DESTROY && msg != WM_NCDESTROY {
+        sync_bar(hwnd);
+    }
+    result
+}
+
+unsafe fn thick_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     let prev: windows::Win32::UI::WindowsAndMessaging::WNDPROC = std::mem::transmute(old);
-    const EDGE: i32 = 3;
     let mut cname = [0u16; 32];
     let cn = GetClassNameW(hwnd, &mut cname);
     let class = String::from_utf16_lossy(&cname[..cn as usize]);
     let combo = class == "ComboBox";
     let edit = class == "Edit";
     if msg == WM_NCCALCSIZE && !combo {
+        let rect: *mut RECT = if wparam.0 != 0 {
+            &mut (*(lparam.0 as *mut NCCALCSIZE_PARAMS)).rgrc[0]
+        } else {
+            lparam.0 as *mut RECT
+        };
+        let before = if rect.is_null() { RECT::default() } else { *rect };
         let _ = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
-        if wparam.0 != 0 {
-            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
-            inset_client(&mut params.rgrc[0], hwnd, edit, EDGE);
-        } else if lparam.0 != 0 {
-            let rect = &mut *(lparam.0 as *mut RECT);
+        if !rect.is_null() {
+            let rect = &mut *rect;
+            let native = before.right - rect.right;
             inset_client(rect, hwnd, edit, EDGE);
+            if !bar_of(hwnd).0.is_null() && style_of(hwnd) & WS_VSCROLL.0 != 0 {
+                // Room for the Windows 2.03 bar instead of the native one.
+                let strip = bar_strip_width(native, EDGE, sb_unit(screen_dpi()));
+                rect.right = (before.right - strip).max(rect.left);
+                let _ = SetPropW(hwnd, w!("OpusWin2BarW"), HANDLE(strip as isize as *mut _));
+            }
         }
         return LRESULT(0);
     }
@@ -363,6 +565,9 @@ unsafe extern "system" fn thick_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     }
     if msg == WM_SIZE && !combo {
         let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        if class == "SysListView32" {
+            fit_column(hwnd);
+        }
         paint_nc_frame(hwnd, EDGE);
         return result;
     }
@@ -1298,6 +1503,391 @@ fn paint_toggle(hwnd: HWND, radio: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows 2.03 scroll bars for native controls (list views, multi-line edits).
+//
+// A native control draws its own scroll bar whenever it scrolls, without a
+// WM_NCPAINT, so painting over it flickers. Instead the control gets a sibling
+// window (OpusWin2Scroll) stacked on top of its scroll bar. The control is
+// given WS_CLIPSIBLINGS, so its own scroll bar can never draw through, and the
+// sibling draws the Windows 2.03 bar and turns clicks and drags into the
+// control's own scroll messages.
+
+pub const SCROLL_CLASS: &str = "OpusWin2Scroll";
+
+const EDGE: i32 = 3;
+const SB_PRESS: i32 = 0;
+const SB_DRAG_Y: i32 = 8;
+const SB_DRAG_POS: i32 = 16;
+const SB_SEEN: i32 = 24;
+const SB_TIMER: usize = 1;
+
+const LVM_GETITEMRECT: u32 = 0x100E;
+const LVM_SCROLL: u32 = 0x1014;
+const LVM_SETCOLUMNWIDTH: u32 = 0x101E;
+const LVM_GETCOLUMNWIDTH: u32 = 0x101D;
+const LVM_GETHEADER: u32 = 0x101F;
+const HDM_GETITEMCOUNT: u32 = 0x1200;
+const EM_LINESCROLL: u32 = 0x00B6;
+
+thread_local! {
+    static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn screen_dpi() -> i32 {
+    unsafe {
+        let dc = GetDC(None);
+        let dpi = GetDeviceCaps(dc, LOGPIXELSX);
+        let _ = ReleaseDC(None, dc);
+        if dpi <= 0 { 96 } else { dpi }
+    }
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut name = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut name) };
+    String::from_utf16_lossy(&name[..n.max(0) as usize])
+}
+
+fn style_of(hwnd: HWND) -> u32 {
+    unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 }
+}
+
+/// Width of the strip the Windows 2.03 bar covers at the control's right
+/// edge: the bar (15 pixels with its lines) plus the control's black frame,
+/// less the line they share. Never narrower than the native bar it hides.
+pub fn bar_strip_width(native: i32, edge: i32, u: i32) -> i32 {
+    let bar = (15 * u).max(native - edge + u);
+    bar + edge - u
+}
+
+fn bar_of(control: HWND) -> HWND {
+    unsafe { HWND(GetPropW(control, w!("OpusWin2Bar")).0) }
+}
+
+fn strip_of(control: HWND) -> i32 {
+    unsafe { GetPropW(control, w!("OpusWin2BarW")).0 as isize as i32 }
+}
+
+/// The control a Windows 2.03 scroll bar window belongs to, or `hwnd` itself.
+pub fn scroll_owner(hwnd: HWND) -> HWND {
+    if hwnd.0.is_null() || class_of(hwnd) != SCROLL_CLASS {
+        return hwnd;
+    }
+    let owner = get_long(hwnd, GWLP_USERDATA.0);
+    if owner == 0 { hwnd } else { HWND(owner as *mut _) }
+}
+
+fn wants_bar(hwnd: HWND, class: &str) -> bool {
+    class == "SysListView32" || (class == "Edit" && style_of(hwnd) & WS_VSCROLL.0 != 0)
+}
+
+fn attach_bar(control: HWND) {
+    unsafe {
+        let Ok(parent) = GetParent(control) else { return; };
+        if parent.0.is_null() {
+            return;
+        }
+        let instance = windows::Win32::Foundation::HINSTANCE(GetWindowLongPtrW(control, GWLP_HINSTANCE) as *mut _);
+        let Ok(bar) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("OpusWin2Scroll"),
+            w!(""),
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1,
+            1,
+            parent,
+            None,
+            instance,
+            None,
+        ) else {
+            return;
+        };
+        set_long(bar, GWLP_USERDATA.0, control.0 as isize);
+        set_long(bar, SB_SEEN, -1);
+        let _ = SetPropW(control, w!("OpusWin2Bar"), HANDLE(bar.0));
+        SetWindowLongPtrW(control, GWL_STYLE, (style_of(control) | WS_CLIPSIBLINGS.0) as isize);
+    }
+}
+
+fn drop_bar(control: HWND) {
+    let bar = bar_of(control);
+    if bar.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = RemovePropW(control, w!("OpusWin2Bar"));
+        let _ = RemovePropW(control, w!("OpusWin2BarW"));
+        set_long(bar, GWLP_USERDATA.0, 0);
+        let _ = DestroyWindow(bar);
+    }
+}
+
+fn scroll_info(control: HWND) -> SCROLLINFO {
+    let mut si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        ..Default::default()
+    };
+    unsafe {
+        if GetScrollInfo(control, SB_VERT, &mut si).is_err() {
+            si.nMin = 0;
+            si.nMax = 0;
+            si.nPage = 1;
+            si.nPos = 0;
+        }
+    }
+    si
+}
+
+/// Keep the bar window on top of the control's scroll bar, shown only while
+/// the control has one, and repaint it when the scroll position changes.
+fn sync_bar(control: HWND) {
+    let bar = bar_of(control);
+    if bar.0.is_null() || SYNCING.get() {
+        return;
+    }
+    SYNCING.set(true);
+    unsafe {
+        let style = style_of(control);
+        let strip = strip_of(control);
+        let show = style & WS_VSCROLL.0 != 0 && style & WS_VISIBLE.0 != 0 && strip > 0;
+        let bar_shown = style_of(bar) & WS_VISIBLE.0 != 0;
+        if show {
+            let parent = GetParent(control).unwrap_or_default();
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(control, &mut wr);
+            let mut pts = [POINT { x: wr.left, y: wr.top }, POINT { x: wr.right, y: wr.bottom }];
+            MapWindowPoints(None, parent, &mut pts);
+            let want = RECT { left: pts[1].x - strip, top: pts[0].y, right: pts[1].x, bottom: pts[1].y };
+            let mut br = RECT::default();
+            let _ = GetWindowRect(bar, &mut br);
+            let mut bp = [POINT { x: br.left, y: br.top }, POINT { x: br.right, y: br.bottom }];
+            MapWindowPoints(None, parent, &mut bp);
+            let have = RECT { left: bp[0].x, top: bp[0].y, right: bp[1].x, bottom: bp[1].y };
+            if !bar_shown || have != want {
+                let _ = SetWindowPos(
+                    bar,
+                    HWND_TOP,
+                    want.left,
+                    want.top,
+                    want.right - want.left,
+                    want.bottom - want.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                let _ = InvalidateRect(bar, None, false);
+            }
+        } else if bar_shown {
+            let _ = SetWindowPos(
+                bar,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_HIDEWINDOW,
+            );
+        }
+        if show {
+            let si = scroll_info(control);
+            let seen = (si.nPos as isize & 0xFFFF)
+                | ((si.nPage as isize & 0xFFFF) << 16)
+                | ((si.nMax as isize & 0xFFFF) << 32)
+                | ((si.nMin as isize & 0xFFFF) << 48);
+            if get_long(bar, SB_SEEN) != seen {
+                set_long(bar, SB_SEEN, seen);
+                let _ = InvalidateRect(bar, None, false);
+            }
+        }
+    }
+    SYNCING.set(false);
+}
+
+/// One-column list views: keep the column inside the client area so the list
+/// never needs a horizontal scroll bar.
+fn fit_column(list: HWND) {
+    if FITTING.get() {
+        return;
+    }
+    unsafe {
+        let header = HWND(SendMessageW(list, LVM_GETHEADER, WPARAM(0), LPARAM(0)).0 as *mut _);
+        if header.0.is_null() || SendMessageW(header, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0 != 1 {
+            return;
+        }
+        let mut c = RECT::default();
+        let _ = GetClientRect(list, &mut c);
+        let want = (c.right - c.left - 2).max(40);
+        if SendMessageW(list, LVM_GETCOLUMNWIDTH, WPARAM(0), LPARAM(0)).0 as i32 == want {
+            return;
+        }
+        FITTING.set(true);
+        SendMessageW(list, LVM_SETCOLUMNWIDTH, WPARAM(0), LPARAM(want as isize));
+        FITTING.set(false);
+    }
+}
+
+fn bar_geometry(bar: HWND, control: HWND) -> Scrollbar {
+    let mut c = RECT::default();
+    unsafe {
+        let _ = GetClientRect(bar, &mut c);
+    }
+    let dpi = screen_dpi();
+    let u = sb_unit(dpi);
+    // The bar's top, right and bottom lines are the control's black frame.
+    let body = RECT { left: 0, top: EDGE - u, right: c.right - EDGE + u, bottom: c.bottom - EDGE + u };
+    let si = scroll_info(control);
+    let content = (si.nMax - si.nMin + 1).max(1);
+    let page = if si.nPage == 0 { 1 } else { si.nPage as i32 };
+    scrollbar_parts(body, si.nPos - si.nMin, page, content, dpi)
+}
+
+fn paint_bar(bar: HWND, control: HWND) {
+    unsafe {
+        let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+        let hdc = BeginPaint(bar, &mut ps);
+        let mut c = RECT::default();
+        let _ = GetClientRect(bar, &mut c);
+        if c.right > 0 && c.bottom > 0 && !control.0.is_null() {
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, c.right, c.bottom);
+            let old = SelectObject(mem, bmp);
+            fill3(mem, c, BLACK);
+            let sb = bar_geometry(bar, control);
+            paint_scrollbar_pressed(mem, &sb, SbHit::from_code(get_long(bar, SB_PRESS)));
+            let _ = BitBlt(hdc, 0, 0, c.right, c.bottom, mem, 0, 0, windows::Win32::Graphics::Gdi::SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
+        }
+        let _ = EndPaint(bar, &ps);
+    }
+}
+
+fn bar_step(control: HWND, part: SbHit) {
+    let code = match part {
+        SbHit::Up => 0,
+        SbHit::Down => 1,
+        SbHit::PageUp => 2,
+        SbHit::PageDown => 3,
+        _ => return,
+    };
+    unsafe {
+        SendMessageW(control, WM_VSCROLL, WPARAM(code), LPARAM(0));
+    }
+}
+
+/// Scroll the control so its first visible line is `target`.
+fn scroll_control_to(control: HWND, target: i32) {
+    let si = scroll_info(control);
+    let delta = target - si.nPos;
+    if delta == 0 {
+        return;
+    }
+    unsafe {
+        if class_of(control) == "SysListView32" {
+            let mut r = RECT { left: 0, ..Default::default() };
+            SendMessageW(control, LVM_GETITEMRECT, WPARAM(0), LPARAM(&mut r as *mut RECT as isize));
+            let row = r.bottom - r.top;
+            if row > 0 {
+                SendMessageW(control, LVM_SCROLL, WPARAM(0), LPARAM((delta * row) as isize));
+            }
+        } else {
+            SendMessageW(control, EM_LINESCROLL, WPARAM(0), LPARAM(delta as isize));
+        }
+    }
+}
+
+fn lparam_point(lparam: LPARAM) -> POINT {
+    POINT { x: (lparam.0 as i16) as i32, y: ((lparam.0 >> 16) as i16) as i32 }
+}
+
+unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let control = HWND(get_long(hwnd, GWLP_USERDATA.0) as *mut _);
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_bar(hwnd, control);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if !control.0.is_null() => {
+            let p = lparam_point(lparam);
+            let sb = bar_geometry(hwnd, control);
+            let part = scrollbar_hit(&sb, p);
+            if part == SbHit::None {
+                return LRESULT(0);
+            }
+            SetCapture(hwnd);
+            set_long(hwnd, SB_PRESS, part.code());
+            if part == SbHit::Thumb {
+                let si = scroll_info(control);
+                set_long(hwnd, SB_DRAG_Y, p.y as isize);
+                set_long(hwnd, SB_DRAG_POS, (si.nPos - si.nMin) as isize);
+            } else {
+                bar_step(control, part);
+                SetTimer(hwnd, SB_TIMER, 350, None);
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE if !control.0.is_null() => {
+            if SbHit::from_code(get_long(hwnd, SB_PRESS)) == SbHit::Thumb {
+                let p = lparam_point(lparam);
+                let sb = bar_geometry(hwnd, control);
+                let start = get_long(hwnd, SB_DRAG_POS) as i32;
+                let target = drag_pos(&sb, start, p.y - get_long(hwnd, SB_DRAG_Y) as i32);
+                let si = scroll_info(control);
+                scroll_control_to(control, target + si.nMin);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == SB_TIMER => {
+            let part = SbHit::from_code(get_long(hwnd, SB_PRESS));
+            if control.0.is_null() || matches!(part, SbHit::None | SbHit::Thumb) {
+                let _ = KillTimer(hwnd, SB_TIMER);
+                return LRESULT(0);
+            }
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let _ = ScreenToClient(hwnd, &mut p);
+            // Keep repeating while the pointer stays on the part that was
+            // pressed; paging stops once the scroll box reaches the pointer.
+            if scrollbar_hit(&bar_geometry(hwnd, control), p) == part {
+                bar_step(control, part);
+            }
+            SetTimer(hwnd, SB_TIMER, 50, None);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let was = SbHit::from_code(get_long(hwnd, SB_PRESS));
+            set_long(hwnd, SB_PRESS, 0);
+            let _ = KillTimer(hwnd, SB_TIMER);
+            let _ = ReleaseCapture();
+            if was != SbHit::None && !control.0.is_null() {
+                SendMessageW(control, WM_VSCROLL, WPARAM(8), LPARAM(0));
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if get_long(hwnd, SB_PRESS) != 0 {
+                set_long(hwnd, SB_PRESS, 0);
+                let _ = KillTimer(hwnd, SB_TIMER);
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL if !control.0.is_null() => SendMessageW(control, msg, wparam, lparam),
+        WM_DESTROY => {
+            let _ = KillTimer(hwnd, SB_TIMER);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 fn get_long(hwnd: HWND, index: i32) -> isize {
     unsafe { GetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(index)) }
 }
@@ -1318,5 +1908,81 @@ mod tests {
         let b = rgb(255, 255, 255);
         assert_eq!(mix(a, b, 0.0), a);
         assert_eq!(mix(a, b, 1.0), b);
+    }
+
+    fn area(h: i32) -> RECT {
+        RECT { left: 0, top: 0, right: 15, bottom: h }
+    }
+
+    #[test]
+    fn scrollbar_matches_windows_203_layout() {
+        // Windows 2.03 vertical scroll bar, 15 x 124 screen pixels, scroll
+        // box halfway: arrow lines at rows 0/15 and 108/123, box lines at 53/70.
+        let sb = scrollbar_parts(area(124), 50, 10, 110, 96);
+        assert_eq!((sb.up.top, sb.up.bottom), (0, 16));
+        assert_eq!((sb.down.top, sb.down.bottom), (108, 124));
+        assert!(sb.has_thumb);
+        assert_eq!((sb.thumb.top, sb.thumb.bottom), (53, 71));
+        let top = scrollbar_parts(area(124), 0, 10, 110, 96);
+        assert_eq!(top.thumb.top, top.up.bottom - 1);
+        let end = scrollbar_parts(area(124), 100, 10, 110, 96);
+        assert_eq!(end.thumb.bottom, end.down.top + 1);
+    }
+
+    #[test]
+    fn no_scroll_box_without_room_or_content() {
+        assert!(!scrollbar_parts(area(124), 0, 10, 10, 96).has_thumb);
+        assert!(!scrollbar_parts(area(40), 0, 2, 10, 96).has_thumb);
+        assert!(scrollbar(area(124), 0, 10, 10, 96).is_none());
+    }
+
+    #[test]
+    fn hit_test_parts() {
+        let sb = scrollbar_parts(area(124), 50, 10, 110, 96);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 7, y: 5 }), SbHit::Up);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 7, y: 120 }), SbHit::Down);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 7, y: 60 }), SbHit::Thumb);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 7, y: 30 }), SbHit::PageUp);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 7, y: 90 }), SbHit::PageDown);
+        assert_eq!(scrollbar_hit(&sb, POINT { x: 20, y: 60 }), SbHit::None);
+    }
+
+    #[test]
+    fn dragging_maps_back_to_positions() {
+        let sb = scrollbar_parts(area(124), 0, 10, 110, 96);
+        assert_eq!(drag_pos(&sb, 0, 0), 0);
+        assert_eq!(drag_pos(&sb, 0, sb.travel), 100);
+        assert_eq!(drag_pos(&sb, 0, sb.travel / 2), 50);
+        assert_eq!(drag_pos(&sb, 50, -1000), 0);
+        assert_eq!(drag_pos(&sb, 50, 1000), 100);
+    }
+
+    #[test]
+    fn track_and_arrow_match_screenshot() {
+        // Rows 16 and 17 of the Windows 2.03 bar ('#' black, '.' white),
+        // starting at the left line.
+        let rows = ["##.###.###.####", "####.###.###.##"];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, ch) in row.chars().enumerate().skip(1).take(13) {
+                let row_in_bar = 16 + r as i32;
+                assert_eq!(track_pixel(c as i32, row_in_bar), ch == '.', "row {} col {}", row_in_bar, c);
+            }
+        }
+        let glyph = ["....#....", "...###...", "..#####..", ".#######.", "#########", "...###...", "...###...", "...###...", "...###...", "...###..."];
+        for (row, line) in glyph.iter().enumerate() {
+            let (from, to) = arrow_row(row as i32);
+            for (col, ch) in line.chars().enumerate() {
+                let lit = (col as i32) >= from && (col as i32) <= to;
+                assert_eq!(lit, ch == '#', "glyph row {} col {}", row, col);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_covers_native_bar() {
+        assert_eq!(bar_strip_width(17, 3, 1), 17);
+        assert_eq!(bar_strip_width(21, 3, 1), 21);
+        assert_eq!(bar_strip_width(34, 3, 2), 34);
+        assert!(bar_strip_width(10, 3, 1) >= 17);
     }
 }
