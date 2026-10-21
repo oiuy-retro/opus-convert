@@ -35,7 +35,7 @@ use windows::Win32::UI::Controls::{
     TTF_IDISHWND, TTF_SUBCLASS, TTTOOLINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_DOWN, VK_RETURN,
+    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_RETURN,
     VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXFRAME, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CYFRAME, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE,
     SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
     WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
     WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER, WM_VSCROLL,
     WNDCLASSW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
 };
@@ -122,6 +122,7 @@ thread_local! {
     static FACE: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
     static WHITE: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
     static WINDOW_BRUSH: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
+    static WORK_DRAG: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -510,6 +511,14 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+        }
+        WM_MOUSEMOVE if drag_work(hwnd, lparam) => LRESULT(0),
+        WM_LBUTTONUP | WM_CAPTURECHANGED if WORK_DRAG.get().is_some() => {
+            WORK_DRAG.set(None);
+            if msg == WM_LBUTTONUP {
+                let _ = ReleaseCapture();
+            }
+            LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -976,20 +985,8 @@ impl App {
             if !self.maximized() {
                 aero::gripper(hdc, RECT { left: 0, top: 0, right: w, bottom: h });
             }
-            let host_h = (chrome.inner.bottom - bar - (chrome.inner.top + header)).max(0);
             let host_w = chrome.inner.right - chrome.inner.left;
-            if let Some(sb) = aero::scrollbar(
-                RECT {
-                    left: chrome.inner.right - aero::scroll_width(self.dpi),
-                    top: chrome.inner.top + header,
-                    right: chrome.inner.right,
-                    bottom: chrome.inner.top + header + host_h,
-                },
-                self.scroll,
-                host_h.max(1),
-                self.content_height.max(1),
-                self.dpi,
-            ) {
+            if let Some(sb) = self.host_scrollbar() {
                 if host_w > aero::scroll_width(self.dpi) {
                     aero::paint_scrollbar(hdc, &sb);
                 }
@@ -1060,12 +1057,15 @@ impl App {
         let header = self.s(46);
         let bar = self.s(46);
         let host_h = (chrome.inner.bottom - bar - (chrome.inner.top + header)).max(0);
+        // The bar's top, right and bottom lines sit on the black header line,
+        // window frame and footer line, as in a Windows 2.03 window.
+        let u = aero::sb_unit(self.dpi);
         aero::scrollbar(
             RECT {
                 left: chrome.inner.right - aero::scroll_width(self.dpi),
-                top: chrome.inner.top + header,
-                right: chrome.inner.right,
-                bottom: chrome.inner.top + header + host_h,
+                top: chrome.inner.top + header - u,
+                right: chrome.inner.right + u,
+                bottom: chrome.inner.top + header + host_h + u,
             },
             self.scroll,
             host_h.max(1),
@@ -1078,10 +1078,8 @@ impl App {
         let p = Self::cap_point(lparam);
         if let Some((origin, start)) = self.sb_drag {
             if let Some(sb) = self.host_scrollbar() {
-                let travel = (sb.track.bottom - sb.track.top - (sb.thumb.bottom - sb.thumb.top)).max(1);
-                let max = (self.content_height - (sb.track.bottom - sb.up.top).max(1)).max(1);
-                let delta = p.y - origin;
-                self.scroll = (start + delta * max / travel).clamp(0, (self.content_height - self.view_h()).max(0));
+                let next = aero::drag_pos(&sb, start, p.y - origin);
+                self.scroll = next.clamp(0, (self.content_height - self.view_h()).max(0));
                 self.shift_kids();
                 self.redraw();
             }
@@ -1847,7 +1845,10 @@ impl App {
             }
             if class_name(kid.hwnd) == "SysListView32" {
                 unsafe {
-                    SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM((w - 8).max(40) as isize));
+                    // Fit the one column inside the client area (it is narrower
+                // while the scroll bar shows) so no horizontal bar appears.
+                let (client_w, _) = client_of(kid.hwnd);
+                SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM((client_w - 2).max(40) as isize));
                 }
             }
         }
@@ -2935,7 +2936,7 @@ fn list_scrollbar_click(hwnd: HWND, lparam: LPARAM) -> bool {
         let visible = visible_rows(hwnd, app.dpi);
         let count = app.rows.len() as i32;
         let Some(sb) = crate::aero::scrollbar(
-            RECT { left: w - crate::aero::scroll_width(app.dpi), top: 0, right: w, bottom: h },
+            work_bar_area(w, h, app.dpi),
             app.list_scroll,
             visible,
             count.max(1),
@@ -2949,11 +2950,46 @@ fn list_scrollbar_click(hwnd: HWND, lparam: LPARAM) -> bool {
             crate::aero::SbHit::Down => app.list_scroll = (app.list_scroll + 1).clamp(0, max_scroll),
             crate::aero::SbHit::PageUp => app.list_scroll = (app.list_scroll - visible).clamp(0, max_scroll),
             crate::aero::SbHit::PageDown => app.list_scroll = (app.list_scroll + visible).clamp(0, max_scroll),
-            crate::aero::SbHit::Thumb | crate::aero::SbHit::None => return false,
+            crate::aero::SbHit::Thumb => {
+                WORK_DRAG.set(Some((p.y, app.list_scroll)));
+                unsafe { SetCapture(hwnd); }
+                return true;
+            }
+            crate::aero::SbHit::None => return false,
         }
         unsafe { let _ = InvalidateRect(hwnd, None, false); }
         true
     })
+}
+
+/// Work list scroll bar body. Its top, right and bottom lines fall on the
+/// list's black frame, just outside the client area.
+fn work_bar_area(w: i32, h: i32, dpi: i32) -> RECT {
+    let u = crate::aero::sb_unit(dpi);
+    RECT { left: w - crate::aero::scroll_width(dpi), top: -u, right: w + u, bottom: h + u }
+}
+
+/// Dragging the work list's scroll box.
+fn drag_work(hwnd: HWND, lparam: LPARAM) -> bool {
+    let Some((origin, start)) = WORK_DRAG.get() else { return false; };
+    let y = ((lparam.0 >> 16) as i16) as i32;
+    APP.with(|slot| {
+        let Ok(mut borrow) = slot.try_borrow_mut() else { return; };
+        let Some(app) = borrow.as_mut() else { return; };
+        let (w, h) = client_of(hwnd);
+        let visible = visible_rows(hwnd, app.dpi);
+        let count = app.rows.len() as i32;
+        let Some(sb) = crate::aero::scrollbar(work_bar_area(w, h, app.dpi), app.list_scroll, visible, count.max(1), app.dpi) else {
+            return;
+        };
+        let next = crate::aero::drag_pos(&sb, start, y - origin).clamp(0, (count - visible).max(0));
+        if next != app.list_scroll {
+            app.list_scroll = next;
+            clamp_list(app, app.rows.len());
+            unsafe { let _ = InvalidateRect(hwnd, None, false); }
+        }
+    });
+    true
 }
 
 fn scroll_work(hwnd: HWND, wparam: WPARAM) {
@@ -3036,7 +3072,7 @@ fn paint_work(hwnd: HWND) {
                 index += 1;
             }
             if let Some(sb) = crate::aero::scrollbar(
-                RECT { left: inner_w, top: 0, right: width, bottom: height },
+                work_bar_area(width, height, app.dpi),
                 app.list_scroll,
                 visible,
                 count.max(1),
@@ -3225,7 +3261,9 @@ fn wheel(msg: &MSG) -> bool {
             x: (msg.lParam.0 as i16) as i32,
             y: ((msg.lParam.0 >> 16) as i16) as i32,
         };
-        let target = WindowFromPoint(point);
+        // Windows 2.03 scroll bars over list views and edits act like the
+        // control underneath.
+        let target = crate::aero::scroll_owner(WindowFromPoint(point));
         let class = class_name(target);
         if class == "OpusWorkList" || class == "SysListView32" || class == "ComboLBox" || class == "ListBox" {
             SendMessageW(target, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
