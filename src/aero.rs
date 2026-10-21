@@ -99,8 +99,11 @@ pub fn fill_dither(hdc: HDC, r: RECT) {
 //   checkerboard (what GrayString did), on the normal white background.
 //   `gray_keep` is that checkerboard, `gray_text` draws text that way.
 // * Windows 2.03 had no progress bar (Setup only printed "Setup is copying
-//   ..."), so for the progress bar we use the pattern the user preferred: the
-//   2.03 scroll-bar track (black, every 4th pixel white, rows shifted by 2).
+//   ..."). The user chose to keep the app's progress bar as it was: 50%
+//   checkerboard empty part, solid black done part.
+// * Where 2.03 shows nothing (the frame of a disabled text field) we use the
+//   pattern the user preferred: the 2.03 scroll-bar track (black, every 4th
+//   pixel white, rows shifted by 2).
 // Each 2.03 pixel is drawn as a `gray_unit` square so it stays crisp.
 // ---------------------------------------------------------------------------
 
@@ -802,36 +805,29 @@ fn paint_window(hwnd: HWND) {
     }
 }
 
-/// Flat black-bordered well. Windows 2.03 had no progress bar, so this uses
-/// the pattern the user chose: the empty part is white and the done part is
-/// filled with the 2.03 scroll-bar track pattern.
+/// Flat black-bordered well; fill is solid black (Win 2.x had no glossy bar).
 pub fn paint(hdc: HDC, bounds: RECT, fraction: f64, failed: bool, _animate: bool) {
-    let _ = failed;
     if bounds.right - bounds.left < 6 || bounds.bottom - bounds.top < 6 {
         return;
     }
     fill3(hdc, bounds, WHITE);
     black_box(hdc, bounds);
-    let inner = inset(bounds, 3);
+    let inner = inset(bounds, 2);
+    fill_dither(hdc, inner);
     let w = (inner.right - inner.left).max(0);
-    let fill_w = progress_fill_width(w, fraction);
+    let fill_w = ((w as f64) * fraction.clamp(0.0, 1.0)).round() as i32;
     if fill_w > 0 {
-        fill_track(
+        fill3(
             hdc,
             RECT {
                 left: inner.left,
                 top: inner.top,
-                right: inner.left + fill_w,
+                right: inner.left + fill_w.min(w),
                 bottom: inner.bottom,
             },
+            BLACK,
         );
     }
-}
-
-/// Width of the done part of a progress well `w` pixels wide.
-pub fn progress_fill_width(w: i32, fraction: f64) -> i32 {
-    let f = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
-    (((w.max(0)) as f64) * f).round() as i32
 }
 
 pub fn enable_glass(_hwnd: HWND, _active: bool) {}
@@ -1554,13 +1550,9 @@ mod tests {
     }
 
     #[test]
-    fn progress_fill_is_clamped() {
-        assert_eq!(progress_fill_width(200, 0.0), 0);
-        assert_eq!(progress_fill_width(200, 0.5), 100);
-        assert_eq!(progress_fill_width(200, 2.0), 200);
-        assert_eq!(progress_fill_width(200, -1.0), 0);
-        assert_eq!(progress_fill_width(200, f64::NAN), 0);
+    fn gray_unit_scales_with_dpi() {
         assert_eq!(gray_unit(96), 1);
+        assert_eq!(gray_unit(144), 1);
         assert_eq!(gray_unit(192), 2);
     }
 }
