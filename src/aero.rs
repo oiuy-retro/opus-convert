@@ -542,10 +542,9 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
 // Measured from real Windows 3.0 screenshots (Control Panel > International,
 // Desktop, Color; Task List and Fonts list boxes):
 // * the field is white with a 1px black border;
-// * the arrow button sits at the right end, sharing that black border. Inside
-//   the border it is 15x17: 2px white highlight on the top/left, 2px dark gray
-//   (128,128,128) shadow on the right/bottom with 45-degree corners, light
-//   gray (192,192,192) face, and a black down arrow with an underline bar;
+// * the arrow button is NOT the 3.0 gray bevelled one: the user chose the
+//   Windows 2.03 scroll-bar down-arrow box instead (white box, 2.03 arrow,
+//   inverted while pressed), divided from the field by a single 1px black line;
 // * when the box has the focus the text is shown highlighted: black with white
 //   text, 1px of white inside the border;
 // * the opened list is a plain 3.0 list box: white, 1px black border, the
@@ -553,25 +552,9 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
 // Each 3.0 pixel becomes a `combo_unit` square so it stays crisp at high DPI.
 // ---------------------------------------------------------------------------
 
-/// Inner width of the 3.0 arrow button (between the black lines), in 3.0 pixels.
-pub const COMBO_BTN_INNER: i32 = 15;
 const GRAY: (u8, u8, u8) = (128, 128, 128);
-const SILVER: (u8, u8, u8) = (192, 192, 192);
 
-/// The 3.0 down arrow with its underline bar: 7 wide, 9 tall ('#' = black).
-pub const GLYPH_COMBO_ARROW: [&str; 9] = [
-    "..###..",
-    "..###..",
-    "..###..",
-    "#######",
-    ".#####.",
-    "..###..",
-    "...#...",
-    ".......",
-    "#######",
-];
-
-/// Pixel scale for the 3.0 combo art: 1 at 96 DPI, 2 at 192 DPI, ...
+/// Pixel scale for the combo art: 1 at 96 DPI, 2 at 192 DPI, ...
 pub fn combo_unit(dpi: i32) -> i32 {
     ((dpi + 24) / 96).max(1)
 }
@@ -591,61 +574,62 @@ fn window_dpi(hwnd: HWND) -> i32 {
     }
 }
 
-/// Colour of one pixel of the 3.0 button bevel inside its black outline.
-/// `w` x `h` is the inner size in 3.0 pixels (15x17 in Windows 3.0 itself).
-/// `pressed` draws the button pushed in: a 1px gray shadow top/left, no highlight.
-pub fn combo_bevel_pixel(x: i32, y: i32, w: i32, h: i32, pressed: bool) -> (u8, u8, u8) {
-    if pressed {
-        return if x == 0 || y == 0 { GRAY } else { SILVER };
+// --- Windows 2.03 arrow box --------------------------------------------------
+// The user wants the dropdown button to be exactly the Windows 2.03 scroll-bar
+// down-arrow box from PR #4. That code is not on main yet, so these two
+// functions are line-for-line copies of PR #4's `arrow_row` and
+// `paint_sb_arrow` (renamed so both can coexist). Once PR #4 is merged, delete
+// them and call `arrow_row` / `paint_sb_arrow(hdc, r, 1, u, pressed)` instead.
+
+/// Columns (inclusive) lit on `row` of the 2.03 up-arrow glyph, tip first:
+/// a 9-pixel-wide head, 5 rows tall, on a 3-pixel-wide shaft, 5 rows long.
+/// (Copy of PR #4's `arrow_row`.)
+pub fn win2_arrow_row(row: i32) -> (i32, i32) {
+    if row < 5 {
+        (4 - row, 4 + row)
+    } else {
+        (3, 5)
     }
-    // Shadow: bottom two rows and right two columns, cut at 45 degrees where
-    // they meet the highlight (top-right and bottom-left corners).
-    let right = x >= w - 2 && !(y == 0 && x == w - 2);
-    let bottom = y >= h - 2 && !(x == 0 && y == h - 2);
-    if right || bottom {
-        return GRAY;
-    }
-    if x < 2 || y < 2 {
-        return WHITE;
-    }
-    SILVER
 }
 
-/// Where the arrow glyph's top-left lands inside the button (3.0 pixels).
-pub fn combo_glyph_origin(w: i32, h: i32, pressed: bool) -> (i32, i32) {
-    let off = if pressed { 1 } else { 0 };
-    ((w - 7) / 2 + off, (h - 9) / 2 + off)
+/// White arrow box with the Windows 2.03 arrow; pressed boxes are inverted
+/// (black box, white arrow). `r` includes the 1-pixel black lines, which the
+/// caller draws. (Copy of PR #4's `paint_sb_arrow`.)
+fn paint_win2_arrow(hdc: HDC, r: RECT, dir: i32, u: i32, pressed: bool) {
+    let face = RECT { left: r.left + u, top: r.top + u, right: r.right - u, bottom: r.bottom - u };
+    if face.right <= face.left || face.bottom <= face.top {
+        return;
+    }
+    let (back, ink) = if pressed { (BLACK, WHITE) } else { (WHITE, BLACK) };
+    fill3(hdc, face, back);
+    let cols = (face.right - face.left) / u;
+    let rows = (face.bottom - face.top) / u;
+    let gx = face.left + ((cols - 9).max(0) / 2) * u;
+    let gy = face.top + ((rows - 10).max(0) / 2) * u;
+    for row in 0..10 {
+        let (from, to) = win2_arrow_row(row);
+        let y = if dir < 0 { gy + row * u } else { gy + (9 - row) * u };
+        if y + u > face.bottom || y < face.top {
+            continue;
+        }
+        fill3(
+            hdc,
+            RECT { left: gx + from * u, top: y, right: (gx + (to + 1) * u).min(face.right), bottom: y + u },
+            ink,
+        );
+    }
 }
+// --- end of copy from PR #4 -----------------------------------------------------
+
+/// Width of the dropdown button in 2.03 pixels including both black lines:
+/// the same 15 as the Windows 2.03 scroll bar, so the boxes match.
+pub const COMBO_BTN_W: i32 = 15;
 
 fn paint_combo_button(dc: HDC, r: RECT, u: i32, pressed: bool) {
-    // Black outline, one 3.0 pixel thick (the left line divides it from the field).
+    // One 2.03 pixel of black line all round; the left line is the single
+    // line that divides the button from the field.
     thick_box(dc, r, u);
-    let inner = inset(r, u);
-    let w = ((inner.right - inner.left) / u).max(9);
-    let h = ((inner.bottom - inner.top) / u).max(11);
-    // Any remainder pixels at high DPI go to the face colour (centre).
-    fill3(dc, inner, SILVER);
-    let ox = inner.left + ((inner.right - inner.left) - w * u) / 2;
-    let oy = inner.top + ((inner.bottom - inner.top) - h * u) / 2;
-    let px = |x: i32, y: i32, c: (u8, u8, u8)| {
-        fill3(dc, RECT { left: ox + x * u, top: oy + y * u, right: ox + (x + 1) * u, bottom: oy + (y + 1) * u }, c);
-    };
-    for y in 0..h {
-        for x in 0..w {
-            let c = combo_bevel_pixel(x, y, w, h, pressed);
-            if c != SILVER {
-                px(x, y, c);
-            }
-        }
-    }
-    let (gx, gy) = combo_glyph_origin(w, h, pressed);
-    for (row, line) in GLYPH_COMBO_ARROW.iter().enumerate() {
-        for (col, ch) in line.bytes().enumerate() {
-            if ch == b'#' {
-                px(gx + col as i32, gy + row as i32, BLACK);
-            }
-        }
-    }
+    paint_win2_arrow(dc, r, 1, u, pressed);
 }
 
 /// Height the closed box is painted at: the clip region set by the UI if any,
@@ -691,8 +675,8 @@ fn paint_combo_face(hwnd: HWND) {
         let face = RECT { left: 0, top: 0, right: w, bottom: h };
         fill3(dc, face, WHITE);
         thick_box(dc, face, u);
-        // 15 inner pixels plus the black line on each side.
-        let bw = (COMBO_BTN_INNER + 2) * u;
+        // Same width as the 2.03 scroll bar (15 pixels with its lines).
+        let bw = COMBO_BTN_W * u;
         let btn = RECT { left: w - bw, top: 0, right: w, bottom: h };
         paint_combo_button(dc, btn, u, combo_pressed(hwnd));
         let enabled = IsWindowEnabled(hwnd).as_bool();
@@ -1577,52 +1561,19 @@ mod tests {
         assert_eq!(mix(a, b, 1.0), b);
     }
 
-    /// Inside of the arrow button of the Country box in a real Windows 3.0
-    /// Control Panel > International screenshot (GUIdebook), between the
-    /// black lines. '.' white, 's' (192,192,192), 'g' (128,128,128), '#' black.
-    const WIN30_COMBO_BUTTON: [&str; 17] = [
-        "..............g",
-        ".............gg",
-        "..sssssssssssgg",
-        "..sssssssssssgg",
-        "..ssss###ssssgg",
-        "..ssss###ssssgg",
-        "..ssss###ssssgg",
-        "..ss#######ssgg",
-        "..sss#####sssgg",
-        "..ssss###ssssgg",
-        "..sssss#sssssgg",
-        "..sssssssssssgg",
-        "..ss#######ssgg",
-        "..sssssssssssgg",
-        "..sssssssssssgg",
-        ".gggggggggggggg",
-        "ggggggggggggggg",
-    ];
-
+    /// The dropdown button uses the Windows 2.03 scroll-bar arrow (the same
+    /// glyph PR #4 checks against the 2.03 screenshot), pointing down.
     #[test]
-    fn combo_button_matches_windows_30_pixel_for_pixel() {
-        let (w, h) = (COMBO_BTN_INNER, 17);
-        let (gx, gy) = combo_glyph_origin(w, h, false);
-        for (y, line) in WIN30_COMBO_BUTTON.iter().enumerate() {
-            let mut got = String::new();
-            for x in 0..w {
-                let (x, y) = (x, y as i32);
-                let in_glyph = x >= gx && y >= gy && x < gx + 7 && y < gy + 9
-                    && GLYPH_COMBO_ARROW[(y - gy) as usize].as_bytes()[(x - gx) as usize] == b'#';
-                got.push(if in_glyph {
-                    '#'
-                } else {
-                    match combo_bevel_pixel(x, y, w, h, false) {
-                        WHITE => '.',
-                        SILVER => 's',
-                        GRAY => 'g',
-                        _ => '?',
-                    }
-                });
+    fn combo_arrow_is_the_win2_scrollbar_glyph() {
+        let up = ["....#....", "...###...", "..#####..", ".#######.", "#########", "...###...", "...###...", "...###...", "...###...", "...###..."];
+        for (row, line) in up.iter().enumerate() {
+            let (from, to) = win2_arrow_row(row as i32);
+            for (col, ch) in line.chars().enumerate() {
+                let lit = (col as i32) >= from && (col as i32) <= to;
+                assert_eq!(lit, ch == '#', "glyph row {} col {}", row, col);
             }
-            assert_eq!(&got, line, "row {y}");
         }
+        assert_eq!(COMBO_BTN_W, 15);
     }
 
     #[test]
@@ -1634,9 +1585,4 @@ mod tests {
         assert_eq!(combo_unit(192), 2);
     }
 
-    #[test]
-    fn pressed_button_moves_glyph_down_right() {
-        assert_eq!(combo_glyph_origin(15, 17, true), (5, 5));
-        assert_eq!(combo_glyph_origin(15, 17, false), (4, 4));
-    }
 }
