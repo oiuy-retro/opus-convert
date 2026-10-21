@@ -2,7 +2,27 @@
 
 Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
-A built copy is in [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe). Put `ffmpeg.exe` and `ffprobe.exe` in the same folder as the program.
+A built copy is in [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe). Put [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/) and [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`) in the same folder as the program.
+
+## Verify the download
+
+SHA-256 of [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe):
+
+```text
+42fe55dbc004eeb62d6b27f725724715ed9a0661fa8ec242ac37e8a3b18d7464
+```
+
+The same hash is in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt). The `Opus.Convert.exe` download on the [v1.0.0 release](https://github.com/oiuy-retro/opus-convert/releases/tag/v1.0.0) is an earlier build; its SHA-256 is `c729281e36b56642bf212ba63932d51cb06373a9a53d683c5289a4c2f8b397d4`. To check a copy on Windows, run this in PowerShell from the repository folder and compare the hash:
+
+```powershell
+Get-FileHash ".\dist\Opus Convert.exe" -Algorithm SHA256
+```
+
+Or, from Command Prompt:
+
+```bat
+certutil -hashfile "dist\Opus Convert.exe" SHA256
+```
 
 ## What it does
 
@@ -35,7 +55,7 @@ When **Look up genre** is on, lookup runs after convert on the output files.
 1. Last.fm `track.getTopTags` with autocorrect off, if a key is present.
 2. Files Last.fm does not match go to [musicnn](https://github.com/jordipons/musicnn).
 
-Type a Last.fm API key in the Options box (under Look up genre). It is stored in `%AppData%\Opus Convert\lastfm.key` and is remembered after a restart. You can also use `lastfm.key` next to the exe (see `lastfm.key.example`) or the `LASTFM_API_KEY` environment variable. Without a key, Last.fm is skipped and musicnn still runs if Python is present.
+Type a Last.fm API key in the Options box (under Look up genre). It is stored in `%AppData%\Opus Convert\lastfm.key` and is remembered after a restart. You can also use `lastfm.key` next to the exe (see `lastfm.key.example`) or the `LASTFM_API_KEY` environment variable. Without a key, Last.fm is skipped and musicnn still runs if [Python](https://www.python.org/downloads/release/python-379/) is present.
 
 musicnn needs a portable Python with the packages listed in [THIRD_PARTY.md](THIRD_PARTY.md), plus `musicnn-one.py` next to the exe.
 
@@ -44,8 +64,8 @@ Genre radios: replace existing genre; keep existing genre on audio; keep existin
 ## Run
 
 1. Copy `dist/Opus Convert.exe` to a folder.
-2. Place [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg.exe` and `ffprobe.exe` beside it.
-3. Optional: `lastfm.key`, `python.exe` (with musicnn), and `musicnn-one.py`.
+2. Place [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg.exe` and `ffprobe.exe` beside it (both ship in the same build).
+3. Optional: `lastfm.key`, [`python.exe`](https://www.python.org/downloads/release/python-379/) (with [musicnn](https://github.com/jordipons/musicnn)), and `musicnn-one.py`.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
 
 Windows 10 or later. The window uses Windows 2.03 chrome (flat black frames, inverted caption, checkerboard dither) and the Explorer folder picker.
