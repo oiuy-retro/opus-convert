@@ -27,18 +27,34 @@ pub fn prepare(ffmpeg: &Path, item: &Item, work_dir: &Path) -> Option<Cover> {
     if item.kind == Kind::Junk {
         return None;
     }
-    if let Some(sidecar) = sidecar(item) {
-        return jpeg(ffmpeg, &sidecar, work_dir);
-    }
     if item.attached_pic {
-        return extract(ffmpeg, &item.source, work_dir);
+        if let Some(cover) = extract(ffmpeg, &item.source, work_dir) {
+            return Some(cover);
+        }
+    }
+    for path in sidecars(item) {
+        if let Some(cover) = jpeg(ffmpeg, &path, work_dir) {
+            return Some(cover);
+        }
     }
     None
 }
 
+/// First existing picture beside the source, if any.
 pub fn sidecar(item: &Item) -> Option<PathBuf> {
-    let dir = item.source.parent()?;
-    let stem = item.source.file_stem()?.to_string_lossy();
+    sidecars(item).into_iter().next()
+}
+
+/// Every existing picture beside the source, best first:
+/// `<song>.*`, then `cover.*`, then `folder.*`.
+pub fn sidecars(item: &Item) -> Vec<PathBuf> {
+    let Some(dir) = item.source.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = item.source.file_stem() else {
+        return Vec::new();
+    };
+    let stem = stem.to_string_lossy();
     let names = [
         format!("{stem}.jpg"),
         format!("{stem}.jpeg"),
@@ -53,13 +69,11 @@ pub fn sidecar(item: &Item) -> Option<PathBuf> {
         "folder.png".into(),
         "folder.webp".into(),
     ];
-    for name in names {
-        let path = dir.join(&name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn jpeg(ffmpeg: &Path, source: &Path, work_dir: &Path) -> Option<Cover> {
@@ -137,17 +151,9 @@ fn file_len(path: &Path) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn prefers_a_same_name_picture() {
-        let dir = std::env::temp_dir().join(format!("opus-cover-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let song = dir.join("Song.mp3");
-        let pic = dir.join("Song.webp");
-        std::fs::write(&song, b"x").unwrap();
-        std::fs::write(&pic, b"x").unwrap();
-        let item = Item {
-            source: song,
+    fn item_for(source: PathBuf) -> Item {
+        Item {
+            source,
             stem: "Song".into(),
             original_stem: "Song".into(),
             extension: "mp3".into(),
@@ -166,8 +172,67 @@ mod tests {
             attached_pic: false,
             track_number: None,
             opus_kbps: Some(96),
-        };
-        assert_eq!(sidecar(&item), Some(pic));
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opus-cover-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prefers_a_same_name_picture() {
+        let dir = temp_dir("same-name");
+        let song = dir.join("Song.mp3");
+        let pic = dir.join("Song.webp");
+        std::fs::write(&song, b"x").unwrap();
+        std::fs::write(&pic, b"x").unwrap();
+        assert_eq!(sidecar(&item_for(song)), Some(pic));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lists_every_sidecar_in_order() {
+        let dir = temp_dir("order");
+        let song = dir.join("Song.mp3");
+        std::fs::write(&song, b"x").unwrap();
+        let folder = dir.join("folder.png");
+        let cover = dir.join("cover.jpeg");
+        let same = dir.join("Song.png");
+        for path in [&folder, &cover, &same] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        assert_eq!(sidecars(&item_for(song)), vec![same, cover, folder]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn falls_back_past_a_broken_picture() {
+        let dir = temp_dir("fallback");
+        let song = dir.join("Song.mp3");
+        std::fs::write(&song, b"x").unwrap();
+        // Not a JPEG, and ffmpeg cannot run, so it cannot be converted.
+        std::fs::write(dir.join("Song.png"), b"not an image").unwrap();
+        let cover = dir.join("cover.jpg");
+        std::fs::write(&cover, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0]).unwrap();
+        let missing_ffmpeg = dir.join("no-ffmpeg.exe");
+        let picked = prepare(&missing_ffmpeg, &item_for(song), &dir).expect("cover.jpg is used");
+        assert_eq!(picked.path, cover);
+        assert!(!picked.temp, "a JPEG sidecar is used as is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_usable_picture_means_no_cover() {
+        let dir = temp_dir("none");
+        let song = dir.join("Song.mp3");
+        std::fs::write(&song, b"x").unwrap();
+        std::fs::write(dir.join("cover.png"), b"not an image").unwrap();
+        let mut item = item_for(song);
+        item.attached_pic = true;
+        assert!(prepare(&dir.join("no-ffmpeg.exe"), &item, &dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

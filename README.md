@@ -28,12 +28,12 @@ On Options you choose the profile, folders, whether to convert audio and/or vide
 
 Album art is saved inside each output file as `cover.jpg`. Opus Convert uses the first image it finds, in this order:
 
-1. An image with the same name as the song, like `Song.jpg`, `Song.jpeg`, `Song.png` or `Song.webp`
-2. `cover.jpg`, `cover.jpeg`, `cover.png` or `cover.webp` in the same folder
-3. `folder.jpg`, `folder.jpeg`, `folder.png` or `folder.webp` in the same folder
-4. Art already embedded in the source file
+1. Art already embedded in the source file
+2. An image with the same name as the song, like `Song.jpg`, `Song.jpeg`, `Song.png` or `Song.webp`
+3. `cover.jpg`, `cover.jpeg`, `cover.png` or `cover.webp` in the same folder
+4. `folder.jpg`, `folder.jpeg`, `folder.png` or `folder.webp` in the same folder
 
-PNG and WebP images are converted to JPEG.
+If an image can't be used, it moves on to the next one. PNG and WebP images are converted to JPEG.
 
 ## Genre lookup
 
