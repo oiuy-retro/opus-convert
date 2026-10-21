@@ -64,7 +64,7 @@ Video files are always looked up, whichever option you choose.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
 5. For Last.fm genres, enter your API key in the **Last.fm key** field on the Options page.
 
-Tested with FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), Python `3.7.9`, and musicnn `0.1.0`.
+Tested with FFmpeg `2026-10-19-git-2344518cc5-full_build` (Gyan), Python `3.7.9`, and musicnn `0.1.0`.
 
 ## Build
 

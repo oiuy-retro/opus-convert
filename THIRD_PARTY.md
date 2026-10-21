@@ -2,7 +2,7 @@
 
 Opus Convert links against or is meant to run next to the following projects. This repository has the Opus Convert sources; the built exe is on the [latest release](https://github.com/oiuy-retro/opus-convert/releases/latest). Neither includes FFmpeg, Python, or musicnn weights.
 
-Tested with FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), Python `3.7.9`, and musicnn `0.1.0`.
+Tested with FFmpeg `2026-10-19-git-2344518cc5-full_build` (Gyan), Python `3.7.9`, and musicnn `0.1.0`.
 
 ## Rust crates (linked into the exe)
 
