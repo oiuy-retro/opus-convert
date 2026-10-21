@@ -1,6 +1,6 @@
 # Opus Convert
 
-Windows Vista–style wizard that converts a folder tree to Opus audio inside `.mkv`.
+Windows 2.03–style wizard that converts a folder tree to Opus audio inside `.mkv`.
 
 A built copy is in [`dist/Opus Convert.exe`](dist/Opus%20Convert.exe). Put `ffmpeg.exe` and `ffprobe.exe` in the same folder as the program.
 
@@ -48,7 +48,7 @@ Genre radios: replace existing genre; keep existing genre on audio; keep existin
 3. Optional: `lastfm.key`, `python.exe` (with musicnn), and `musicnn-one.py`.
 4. Start `Opus Convert.exe`. The working directory must be that folder.
 
-Windows 10 or later. The window uses Vista Aero chrome and the Explorer folder picker.
+Windows 10 or later. The window uses Windows 2.03 chrome (flat black frames, inverted caption, checkerboard dither) and the Explorer folder picker.
 
 ## Build
 
