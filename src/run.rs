@@ -136,7 +136,7 @@ pub fn kill_child(shared: &Shared) {
 
 pub fn convert(shared: Arc<Shared>, ffmpeg: PathBuf, ffprobe: PathBuf, opts: Options, groups: Vec<Group>) {
     reset(&shared);
-    let output = PathBuf::from(opts.output.trim());
+    let output = paths::full(Path::new(opts.output.trim()));
     if let Err(err) = fs::create_dir_all(paths::extended(&output)) {
         finish(&shared, groups, format!("Could not create the output folder: {err}"));
         return;
@@ -149,6 +149,7 @@ pub fn convert(shared: Arc<Shared>, ffmpeg: PathBuf, ffprobe: PathBuf, opts: Opt
         live.rows = rows;
     }
     let mut ready: Vec<ReadyFile> = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
     for group in &groups {
         let dir = paths::output_dir(&output, &group.rel, &map);
         let _ = fs::create_dir_all(paths::extended(&dir));
@@ -186,8 +187,24 @@ pub fn convert(shared: Arc<Shared>, ffmpeg: PathBuf, ffprobe: PathBuf, opts: Opt
             set_kind(&shared, row_id, RowKind::Active, "");
             set_status(&shared, &item.stem);
             let (stem, extension) = paths::output_name(&item, &opts);
-            let dest = paths::unique_path(&dir, &stem, &extension);
-            if convert::copy_media(&item, &opts) {
+            let copy = convert::copy_media(&item, &opts);
+            // A finished file from an earlier run is kept instead of making
+            // "Song (2).m4a" next to it.
+            let (dest, done) = paths::pick_dest(&dir, &stem, &extension, &mut claimed, |path| {
+                if copy {
+                    file_len(path) == item.size
+                } else {
+                    finished(&ffprobe, &item, path)
+                }
+            });
+            if done {
+                let size = file_len(&dest);
+                set_fraction(&shared, row_id, 1.0);
+                remember(&mut ready, &item, dest, size);
+                remove_done(&shared, row_id, size);
+                continue;
+            }
+            if copy {
                 match copy_file(&shared, row_id, &item.source, &dest, item.size) {
                     Ok(()) => {
                         remember(&mut ready, &item, dest, item.size);
@@ -197,7 +214,7 @@ pub fn convert(shared: Arc<Shared>, ffmpeg: PathBuf, ffprobe: PathBuf, opts: Opt
                 }
                 continue;
             }
-            match convert_one(&shared, &ffmpeg, &ffprobe, &item, &dest, &album) {
+            match convert_one(&shared, &ffmpeg, &item, &dest, &album) {
                 Ok(size) => {
                     remember(&mut ready, &item, dest, size);
                     remove_done(&shared, row_id, size);
@@ -245,17 +262,12 @@ fn remember(ready: &mut Vec<ReadyFile>, item: &Item, dest: PathBuf, size: u64) {
 fn convert_one(
     shared: &Arc<Shared>,
     ffmpeg: &Path,
-    ffprobe: &Path,
     item: &Item,
     dest: &Path,
     album: &str,
 ) -> Result<u64, String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(paths::extended(parent)).map_err(|err| err.to_string())?;
-    }
-    if skip_existing(ffprobe, item, dest) {
-        set_fraction(shared, row_id(&item.source), 1.0);
-        return Ok(fs::metadata(paths::extended(dest)).map(|meta| meta.len()).unwrap_or(0));
     }
     let work_dir = dest.parent().unwrap_or(Path::new("."));
     let cover = cover::prepare(ffmpeg, item, work_dir);
@@ -304,28 +316,24 @@ fn convert_one(
     }
 }
 
-fn skip_existing(ffprobe: &Path, item: &Item, dest: &Path) -> bool {
+/// True when `dest` is a finished conversion of `item` from an earlier run:
+/// it plays, is at least 90% as long as the source, and has the cover when
+/// one is expected. Nothing is deleted here.
+fn finished(ffprobe: &Path, item: &Item, dest: &Path) -> bool {
     if !dest.is_file() {
         return false;
     }
     let Ok(info) = probe::probe(ffprobe, dest) else {
-        let _ = fs::remove_file(paths::extended(dest));
         return false;
     };
     if info.duration <= 0.0 {
-        let _ = fs::remove_file(paths::extended(dest));
         return false;
     }
     if item.duration > 1.0 && info.duration < item.duration * 0.90 {
-        let _ = fs::remove_file(paths::extended(dest));
         return false;
     }
     let wants_cover = item.attached_pic || cover::sidecar(item).is_some();
-    if wants_cover && !info.has_cover {
-        let _ = fs::remove_file(paths::extended(dest));
-        return false;
-    }
-    true
+    !(wants_cover && !info.has_cover)
 }
 
 fn fallback_path(dir: &Path, item: &Item) -> PathBuf {
@@ -856,12 +864,7 @@ where
             push_log(&log_err, &line);
         });
     });
-    let status = shared
-        .child
-        .lock()
-        .expect("child")
-        .as_mut()
-        .and_then(|child| child.wait().ok());
+    let status = wait_child(shared);
     *shared.child.lock().expect("child") = None;
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
@@ -873,18 +876,39 @@ where
     Ok(RunOut { code, log: log_text })
 }
 
+/// Wait for the running child without holding the lock the whole time, so
+/// `kill_child` (Cancel) can get in and stop it.
+fn wait_child(shared: &Shared) -> Option<std::process::ExitStatus> {
+    loop {
+        {
+            let mut slot = shared.child.lock().expect("child");
+            let child = slot.as_mut()?;
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(_) => return child.wait().ok(),
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Read lines until the pipe closes. Lines that are not valid UTF-8 are kept
+/// (with replacement characters) instead of ending the read, so progress keeps
+/// updating and the log keeps ffmpeg's error text.
 fn read_lines<R, F>(reader: R, mut on_line: F)
 where
     R: Read,
     F: FnMut(String),
 {
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
-            Ok(_) => on_line(line.trim_end_matches(['\r', '\n']).to_string()),
+            Ok(_) => on_line(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -1097,7 +1121,7 @@ mod tests {
         assert_eq!(mp3["album_artist"], "Album Artist");
 
         // A second run keeps the finished files.
-        assert!(skip_existing(&bundle.ffprobe, &crate::model::Item {
+        assert!(finished(&bundle.ffprobe, &crate::model::Item {
             source: album.join("Wav.wav"),
             stem: "Wav".into(),
             original_stem: "Wav".into(),
@@ -1121,5 +1145,58 @@ mod tests {
         if !keep {
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn read_lines_keeps_reading_past_invalid_utf8() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"out_time_us=1000000\n");
+        data.extend_from_slice(b"title=\xff\xfe bad \xc3\n");
+        for n in 0..20_000 {
+            data.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"progress=end");
+        let mut lines = Vec::new();
+        read_lines(std::io::Cursor::new(data), |line| lines.push(line));
+        assert_eq!(lines.len(), 20_003);
+        assert_eq!(lines[0], "out_time_us=1000000");
+        assert_eq!(lines[1], "title=\u{fffd}\u{fffd} bad \u{fffd}");
+        assert_eq!(lines[2], "line 0");
+        assert_eq!(lines.last().unwrap(), "progress=end");
+    }
+
+    /// Not a real test: the slow child for `cancel_stops_a_running_child`.
+    #[test]
+    #[ignore]
+    fn slow_child_helper() {
+        if std::env::var_os("OPUS_SLOW_CHILD").is_some() {
+            thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn cancel_stops_a_running_child() {
+        let shared = Shared::new();
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("OPUS_SLOW_CHILD", "1");
+        let args: Vec<String> = ["slow_child_helper", "--ignored", "--exact", "run::tests::slow_child_helper"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let killer = Arc::clone(&shared);
+        let started = std::time::Instant::now();
+        let cancel = thread::spawn(move || {
+            // Wait until the child is running, then press "Cancel".
+            while killer.child.lock().unwrap().is_none() {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+            thread::sleep(std::time::Duration::from_millis(300));
+            kill_child(&killer);
+        });
+        let result = run_command(&shared, &exe, &args, |_| {});
+        cancel.join().unwrap();
+        assert_eq!(result.err().as_deref(), Some("Stopped."));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(shared.child.lock().unwrap().is_none());
     }
 }
