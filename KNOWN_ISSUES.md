@@ -1,12 +1,8 @@
 # Known issues
 
-Recorded 2026-10-21. These are still the default Windows look. They need the same Windows 2.03 chrome as the rest of the window (flat black frames, 50% checkerboard dither).
+Recorded 2026-10-21. This is still the default Windows look. It needs the same Windows 2.03 chrome as the rest of the window (flat black frames, 50% checkerboard dither).
 
 Open copies live on the [Issues](https://github.com/oiuy-retro/opus-convert/issues) tab.
-
-## Scrollbars
-
-[#1](https://github.com/oiuy-retro/opus-convert/issues/1). Page and list scrollbars still look like ordinary Windows scrollbars. They should use a dithered track, a thick black frame, and square arrow boxes.
 
 ## Dropdown lists
 
