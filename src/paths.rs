@@ -145,24 +145,24 @@ pub fn output_name(item: &Item, opts: &Options) -> (String, String) {
 }
 
 pub fn unique_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
-    let first = if extension.is_empty() {
-        dir.join(stem)
-    } else {
-        dir.join(format!("{stem}.{extension}"))
-    };
-    if !first.exists() {
-        return first;
-    }
-    for number in 2..10_000 {
-        let candidate = if extension.is_empty() {
-            dir.join(format!("{stem} ({number})"))
+    candidates(dir, stem, extension)
+        .find(|candidate| !candidate.exists())
+        .unwrap_or_else(|| last_resort(dir, stem, extension))
+}
+
+/// The names `unique_path` tries, in order: `Song.m4a`, `Song (2).m4a`, ...
+pub fn candidates<'a>(dir: &'a Path, stem: &'a str, extension: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+    (1..10_000).map(move |number| {
+        let name = if number == 1 { stem.to_string() } else { format!("{stem} ({number})") };
+        if extension.is_empty() {
+            dir.join(name)
         } else {
-            dir.join(format!("{stem} ({number}).{extension}"))
-        };
-        if !candidate.exists() {
-            return candidate;
+            dir.join(format!("{name}.{extension}"))
         }
-    }
+    })
+}
+
+fn last_resort(dir: &Path, stem: &str, extension: &str) -> PathBuf {
     if extension.is_empty() {
         dir.join(format!("{stem} copy"))
     } else {
@@ -170,16 +170,66 @@ pub fn unique_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
     }
 }
 
-pub fn extended(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text.starts_with(r"\\?\") {
+/// Where a file should go when an earlier run may have left finished copies
+/// behind. Walks `Song.m4a`, `Song (2).m4a`, ... skipping names already used in
+/// this run (`claimed`, lowercase). The first name that is free is returned with
+/// `false` (write it). A name that exists and `is_done` accepts is returned with
+/// `true` (the file is already there; skip it). Files that exist but are not
+/// accepted are left alone.
+pub fn pick_dest(
+    dir: &Path,
+    stem: &str,
+    extension: &str,
+    claimed: &mut std::collections::HashSet<String>,
+    is_done: impl Fn(&Path) -> bool,
+) -> (PathBuf, bool) {
+    for candidate in candidates(dir, stem, extension) {
+        let key = candidate.to_string_lossy().to_lowercase();
+        if claimed.contains(&key) {
+            continue;
+        }
+        if !candidate.exists() {
+            claimed.insert(key);
+            return (candidate, false);
+        }
+        if candidate.is_file() && is_done(&candidate) {
+            claimed.insert(key);
+            return (candidate, true);
+        }
+    }
+    let path = last_resort(dir, stem, extension);
+    claimed.insert(path.to_string_lossy().to_lowercase());
+    (path, false)
+}
+
+/// A folder the user typed, as a full Windows path: relative paths are taken
+/// from the current folder, `/` becomes `\`, and `.` and `..` are resolved.
+/// Paths that already start with `\\?\` are kept as they are.
+pub fn full(path: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
         return path.to_path_buf();
     }
-    if text.starts_with(r"\\") {
-        PathBuf::from(format!(r"\\?\UNC\{}", text.trim_start_matches('\\')))
-    } else {
-        PathBuf::from(format!(r"\\?\{text}"))
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub fn extended(path: &Path) -> PathBuf {
+    let full = full(path);
+    let text = full.as_os_str();
+    let lossy = text.to_string_lossy();
+    if lossy.starts_with(r"\\?\") {
+        return full;
     }
+    let mut out = std::ffi::OsString::new();
+    if lossy.starts_with(r"\\") {
+        // \\server\share\x -> \\?\UNC\server\share\x
+        out.push(r"\\?\UNC\");
+        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(text).skip(2).collect();
+        out.push(<std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&wide));
+    } else {
+        out.push(r"\\?\");
+        out.push(text);
+    }
+    PathBuf::from(out)
 }
 
 pub fn display_path(path: &Path) -> String {
@@ -214,5 +264,67 @@ mod tests {
         map.insert(r"artist\album".into(), "News".into());
         let path = output_dir(Path::new(r"D:\Out"), r"artist\album", &map);
         assert_eq!(path, PathBuf::from(r"D:\Out\Queen\News"));
+    }
+
+    #[test]
+    fn full_paths_fix_slashes_dots_and_relative_folders() {
+        assert_eq!(full(Path::new("D:/Music/./Rock/../Pop")), PathBuf::from(r"D:\Music\Pop"));
+        assert_eq!(full(Path::new(r"\\server\share/Music")), PathBuf::from(r"\\server\share\Music"));
+    }
+
+    #[test]
+    fn extended_prefixes_once_and_handles_unc() {
+        assert_eq!(extended(Path::new("D:/Music/x/../Song.flac")), PathBuf::from(r"\\?\D:\Music\Song.flac"));
+        assert_eq!(extended(Path::new(r"\\server\share\a")), PathBuf::from(r"\\?\UNC\server\share\a"));
+        assert_eq!(extended(Path::new(r"\\?\D:\Music")), PathBuf::from(r"\\?\D:\Music"));
+        assert_eq!(extended(Path::new(r"\\?\UNC\server\share")), PathBuf::from(r"\\?\UNC\server\share"));
+        assert_eq!(extended(&extended(Path::new("D:/a"))), PathBuf::from(r"\\?\D:\a"));
+    }
+
+    #[test]
+    fn relative_and_slash_folders_can_be_read() {
+        let root = std::env::temp_dir().join(format!("opus-paths-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("In")).unwrap();
+        std::fs::write(root.join("In").join("a.txt"), b"x").unwrap();
+        let slashed = root.to_string_lossy().replace('\\', "/") + "/In/../In";
+        assert!(std::fs::read_dir(extended(Path::new(&slashed))).unwrap().count() == 1);
+        // The only test that changes the current folder, so nothing else races it.
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let here = std::env::current_dir().unwrap();
+        let named = (full(Path::new("out")), full(Path::new(r"In\..\out")), display_path(&extended(Path::new("out"))));
+        let relative = std::fs::read_dir(extended(Path::new("In"))).map(|d| d.count());
+        std::fs::create_dir_all(extended(Path::new("Out/Sub"))).unwrap();
+        let made = root.join("Out").join("Sub").is_dir();
+        std::env::set_current_dir(old).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(named.0, here.join("out"));
+        assert_eq!(named.1, here.join("out"));
+        assert_eq!(named.2, here.join("out").to_string_lossy());
+        assert_eq!(relative.unwrap(), 1);
+        assert!(made);
+    }
+
+    #[test]
+    fn pick_dest_reuses_finished_files_and_never_doubles_up() {
+        let dir = std::env::temp_dir().join(format!("opus-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut claimed = std::collections::HashSet::new();
+        // First run: nothing there yet.
+        assert_eq!(pick_dest(&dir, "Song", "m4a", &mut claimed, |_| true), (dir.join("Song.m4a"), false));
+        std::fs::write(dir.join("Song.m4a"), b"done").unwrap();
+        // A second song with the same name in the same run gets "(2)".
+        assert_eq!(pick_dest(&dir, "Song", "m4a", &mut claimed, |_| true), (dir.join("Song (2).m4a"), false));
+        std::fs::write(dir.join("Song (2).m4a"), b"done").unwrap();
+        // Second run: both finished files are found again and skipped.
+        let mut again = std::collections::HashSet::new();
+        assert_eq!(pick_dest(&dir, "Song", "m4a", &mut again, |_| true), (dir.join("Song.m4a"), true));
+        assert_eq!(pick_dest(&dir, "song", "m4a", &mut again, |_| true), (dir.join("song (2).m4a"), true));
+        // A file that is not a finished copy is left alone, and a new name is used.
+        let mut third = std::collections::HashSet::new();
+        assert_eq!(pick_dest(&dir, "Song", "m4a", &mut third, |_| false), (dir.join("Song (3).m4a"), false));
+        assert!(dir.join("Song.m4a").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

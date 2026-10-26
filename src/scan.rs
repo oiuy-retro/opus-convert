@@ -15,7 +15,7 @@ use crate::run::Shared;
 pub fn scan(shared: Arc<Shared>, ffprobe: PathBuf, opts: Options) {
     crate::run::reset(&shared);
     crate::run::set_status(&shared, "Reading the folder…");
-    let input = PathBuf::from(opts.input.trim());
+    let input = paths::full(Path::new(opts.input.trim()));
     let files = match collect_files(&input) {
         Ok(files) => files,
         Err(err) => {

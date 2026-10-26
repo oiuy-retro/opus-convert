@@ -126,7 +126,7 @@ pub fn problems(opts: &Options) -> Vec<String> {
     let output = opts.output.trim();
     if input.is_empty() {
         out.push("Choose an input folder.".into());
-    } else if !Path::new(input).is_dir() {
+    } else if !crate::paths::extended(Path::new(input)).is_dir() {
         out.push("The input folder could not be found.".into());
     }
     if output.is_empty() {
@@ -156,7 +156,9 @@ fn nested_message(input: &str, output: &str) -> Option<String> {
 }
 
 fn normalize(path: &str) -> String {
-    let mut text = path.replace('/', "\\");
+    // The same full path the scan and the conversion will use.
+    let full = crate::paths::full(Path::new(path));
+    let mut text = full.to_string_lossy().replace('/', "\\");
     while text.ends_with('\\') && text.len() > 3 {
         text.pop();
     }
