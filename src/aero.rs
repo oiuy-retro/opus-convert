@@ -533,6 +533,24 @@ unsafe fn thick_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> L
         paint_combo_face(hwnd);
         return result;
     }
+    // The native combo repaints its box straight away (not via WM_PAINT) on
+    // focus, clicks, keys and selection changes, so paint the 3.0 box again.
+    if combo
+        && matches!(
+            msg,
+            WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | 0x0102 | 0x0215 | WM_ENABLE
+                | 0x014E | 0x000C
+        )
+    {
+        let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        paint_combo_face(hwnd);
+        return result;
+    }
+    if combo && msg == WM_MOUSEMOVE && windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd {
+        let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+        paint_combo_face(hwnd);
+        return result;
+    }
     if msg == WM_PAINT && edit && !IsWindowEnabled(hwnd).as_bool() {
         paint_disabled_edit(hwnd);
         return LRESULT(0);
@@ -696,7 +714,9 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
             ..Default::default()
         };
         if GetComboBoxInfo(hwnd, &mut info).is_ok() {
-            let h = info.rcItem.bottom.max(info.rcButton.bottom);
+            // The native frame is as thick below the text/button as above it,
+            // so the whole closed box is bottom + top (not just bottom).
+            let h = (info.rcItem.bottom + info.rcItem.top).max(info.rcButton.bottom + info.rcButton.top);
             if (9..=96).contains(&h) {
                 return h;
             }
@@ -720,37 +740,166 @@ pub fn combo_face_height(hwnd: HWND) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows 3.0 drop-down list ("combo box").
+//
+// Windows 2.03 had no combo box, so the user picked the Windows 3.0 one.
+// Measured from real Windows 3.0 screenshots (Control Panel > International,
+// Desktop, Color; Task List and Fonts list boxes):
+// * the field is white with a 1px black border;
+// * the arrow button is NOT the 3.0 gray bevelled one: the user chose the
+//   Windows 2.03 scroll-bar down-arrow box instead (white box, 2.03 arrow,
+//   inverted while pressed), divided from the field by a single 1px black line;
+// * when the box has the focus the text is shown highlighted: black with white
+//   text, 1px of white inside the border;
+// * the opened list is a plain 3.0 list box: white, 1px black border, the
+//   selected item black with white text.
+// Each 3.0 pixel becomes a `combo_unit` square so it stays crisp at high DPI.
+// ---------------------------------------------------------------------------
+
+const GRAY: (u8, u8, u8) = (128, 128, 128);
+
+/// Pixel scale for the combo art: 1 at 96 DPI, 2 at 192 DPI, ...
+pub fn combo_unit(dpi: i32) -> i32 {
+    ((dpi + 24) / 96).max(1)
+}
+
+fn window_dpi(hwnd: HWND) -> i32 {
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("user32.dll")) else {
+            return 96;
+        };
+        let Some(proc) = GetProcAddress(lib, windows::core::s!("GetDpiForWindow")) else {
+            return 96;
+        };
+        type GetDpi = unsafe extern "system" fn(HWND) -> u32;
+        let get: GetDpi = std::mem::transmute(proc);
+        let dpi = get(hwnd) as i32;
+        if dpi <= 0 { 96 } else { dpi }
+    }
+}
+
+// --- Windows 2.03 arrow box --------------------------------------------------
+// The user wants the dropdown button to be exactly the Windows 2.03 scroll-bar
+// down-arrow box from PR #4. That code is not on main yet, so these two
+// functions are line-for-line copies of PR #4's `arrow_row` and
+// `paint_sb_arrow` (renamed so both can coexist). Once PR #4 is merged, delete
+// them and call `arrow_row` / `paint_sb_arrow(hdc, r, 1, u, pressed)` instead.
+
+/// Columns (inclusive) lit on `row` of the 2.03 up-arrow glyph, tip first:
+/// a 9-pixel-wide head, 5 rows tall, on a 3-pixel-wide shaft, 5 rows long.
+/// (Copy of PR #4's `arrow_row`.)
+pub fn win2_arrow_row(row: i32) -> (i32, i32) {
+    if row < 5 {
+        (4 - row, 4 + row)
+    } else {
+        (3, 5)
+    }
+}
+
+/// White arrow box with the Windows 2.03 arrow; pressed boxes are inverted
+/// (black box, white arrow). `r` includes the 1-pixel black lines, which the
+/// caller draws. (Copy of PR #4's `paint_sb_arrow`.)
+fn paint_win2_arrow(hdc: HDC, r: RECT, dir: i32, u: i32, pressed: bool) {
+    let face = RECT { left: r.left + u, top: r.top + u, right: r.right - u, bottom: r.bottom - u };
+    if face.right <= face.left || face.bottom <= face.top {
+        return;
+    }
+    let (back, ink) = if pressed { (BLACK, WHITE) } else { (WHITE, BLACK) };
+    fill3(hdc, face, back);
+    let cols = (face.right - face.left) / u;
+    let rows = (face.bottom - face.top) / u;
+    let gx = face.left + ((cols - 9).max(0) / 2) * u;
+    let gy = face.top + ((rows - 10).max(0) / 2) * u;
+    for row in 0..10 {
+        let (from, to) = win2_arrow_row(row);
+        let y = if dir < 0 { gy + row * u } else { gy + (9 - row) * u };
+        if y + u > face.bottom || y < face.top {
+            continue;
+        }
+        fill3(
+            hdc,
+            RECT { left: gx + from * u, top: y, right: (gx + (to + 1) * u).min(face.right), bottom: y + u },
+            ink,
+        );
+    }
+}
+// --- end of copy from PR #4 -----------------------------------------------------
+
+/// Width of the dropdown button in 2.03 pixels including both black lines:
+/// the same 15 as the Windows 2.03 scroll bar, so the boxes match.
+pub const COMBO_BTN_W: i32 = 15;
+
+fn paint_combo_button(dc: HDC, r: RECT, u: i32, pressed: bool) {
+    // One 2.03 pixel of black line all round; the left line is the single
+    // line that divides the button from the field.
+    thick_box(dc, r, u);
+    paint_win2_arrow(dc, r, 1, u, pressed);
+}
+
+/// Height the closed box is painted at: the clip region set by the UI if any,
+/// otherwise what the control reports.
+fn combo_painted_height(hwnd: HWND) -> i32 {
+    unsafe {
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        let mut h = 0;
+        if GetWindowRgn(hwnd, rgn).0 != 0 {
+            let mut boxr = RECT::default();
+            if GetRgnBox(rgn, &mut boxr).0 != 0 {
+                h = boxr.bottom - boxr.top;
+            }
+        }
+        let _ = DeleteObject(rgn);
+        if (9..=96).contains(&h) {
+            return h;
+        }
+    }
+    combo_face_height(hwnd).max(22)
+}
+
+/// True while the arrow button is held down (the control's own pressed state,
+/// STATE_SYSTEM_PRESSED), so the button pops back up once the mouse is released.
+fn combo_pressed(hwnd: HWND) -> bool {
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        GetComboBoxInfo(hwnd, &mut info).is_ok() && info.stateButton.0 & 0x8 != 0
+    }
+}
+
 fn paint_combo_face(hwnd: HWND) {
     unsafe {
         let dc = GetWindowDC(hwnd);
         let mut wr = RECT::default();
         let _ = GetWindowRect(hwnd, &mut wr);
+        let u = combo_unit(window_dpi(hwnd));
         let w = wr.right - wr.left;
-        let h = combo_face_height(hwnd).max(22);
+        let h = combo_painted_height(hwnd);
         let face = RECT { left: 0, top: 0, right: w, bottom: h };
         fill3(dc, face, WHITE);
-        black_box(dc, face);
-        let aw = h.max(16);
-        let btn = RECT { left: w - aw, top: 0, right: w, bottom: h };
-        fill3(dc, btn, WHITE);
-        black_box(dc, btn);
-        arrow(
-            dc,
-            (btn.left + btn.right) / 2,
-            (btn.top + btn.bottom) / 2,
-            (aw / 2 - 3).max(4),
-            1,
-            BLACK,
-        );
-        let mut buf = [0u16; 128];
+        thick_box(dc, face, u);
+        // Same width as the 2.03 scroll bar (15 pixels with its lines).
+        let bw = COMBO_BTN_W * u;
+        let btn = RECT { left: w - bw, top: 0, right: w, bottom: h };
+        paint_combo_button(dc, btn, u, combo_pressed(hwnd));
+        let enabled = IsWindowEnabled(hwnd).as_bool();
+        let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
+        let mut buf = [0u16; 256];
         let len = GetWindowTextW(hwnd, &mut buf);
+        let hl = RECT { left: 2 * u, top: 2 * u, right: btn.left - u, bottom: h - 2 * u };
+        let selected = focused && enabled && len > 0;
+        if selected {
+            fill3(dc, hl, BLACK);
+        }
         if len > 0 {
             let text = String::from_utf16_lossy(&buf[..len as usize]);
             let font = HFONT(SendMessageW(hwnd, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
             let old = if !font.0.is_null() { SelectObject(dc, font) } else { std::mem::zeroed() };
-            let mut tr = RECT { left: 8, top: 0, right: btn.left - 4, bottom: h };
+            let mut tr = RECT { left: hl.left + 2 * u, top: hl.top, right: hl.right - u, bottom: hl.bottom };
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, rgb3(BLACK));
+            SetTextColor(dc, rgb3(if !enabled { GRAY } else if selected { WHITE } else { BLACK }));
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             let _ = DrawTextW(
                 dc,
@@ -766,6 +915,98 @@ fn paint_combo_face(hwnd: HWND) {
         }
         let _ = ReleaseDC(hwnd, dc);
     }
+}
+
+/// Owner-draw one item of a 3.0 drop-down list (WM_DRAWITEM from the combo's parent).
+/// Returns false when the message is not for one of our combo boxes.
+pub fn draw_combo_item(lparam: LPARAM) -> bool {
+    use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+    unsafe {
+        if lparam.0 == 0 {
+            return false;
+        }
+        let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+        if item.CtlType.0 != 3 {
+            return false;
+        }
+        // The closed box is painted by paint_combo_face.
+        if item.itemState.0 & 0x1000 != 0 {
+            return true;
+        }
+        let dc = item.hDC;
+        let r = item.rcItem;
+        let selected = item.itemState.0 & 0x1 != 0;
+        fill3(dc, r, if selected { BLACK } else { WHITE });
+        if item.itemID == u32::MAX {
+            return true;
+        }
+        let combo = item.hwndItem;
+        let n = SendMessageW(combo, 0x0149, WPARAM(item.itemID as usize), LPARAM(0)).0;
+        if n <= 0 {
+            return true;
+        }
+        let mut buf = vec![0u16; n as usize + 1];
+        let got = SendMessageW(combo, 0x0148, WPARAM(item.itemID as usize), LPARAM(buf.as_mut_ptr() as isize)).0;
+        if got <= 0 {
+            return true;
+        }
+        buf.truncate(got as usize);
+        let u = combo_unit(window_dpi(combo));
+        let font = HFONT(SendMessageW(combo, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let old = if !font.0.is_null() { SelectObject(dc, font) } else { std::mem::zeroed() };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, rgb3(if selected { WHITE } else { BLACK }));
+        let mut tr = RECT { left: r.left + 2 * u, top: r.top, right: r.right - u, bottom: r.bottom };
+        let _ = DrawTextW(
+            dc,
+            &mut buf,
+            &mut tr,
+            windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
+                DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
+            ),
+        );
+        if !font.0.is_null() {
+            SelectObject(dc, old);
+        }
+        true
+    }
+}
+
+/// Give the opened list (the ComboLBox popup) the 3.0 list-box frame:
+/// unthemed, 1px black border.
+pub fn style_combo_list(combo: HWND) {
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        if GetComboBoxInfo(combo, &mut info).is_err() || info.hwndList.0.is_null() {
+            return;
+        }
+        let list = info.hwndList;
+        let ours: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = list_proc;
+        if GetWindowLongPtrW(list, GWLP_WNDPROC) == ours as isize {
+            return;
+        }
+        untheme(list);
+        let old = GetWindowLongPtrW(list, GWLP_WNDPROC);
+        SetWindowLongPtrW(list, GWLP_USERDATA, old);
+        SetWindowLongPtrW(list, GWLP_WNDPROC, ours as isize);
+    }
+}
+
+unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let prev: windows::Win32::UI::WindowsAndMessaging::WNDPROC = std::mem::transmute(old);
+    let result = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+    if msg == WM_NCPAINT || msg == 0x0086 || msg == WM_SIZE || msg == 0x0047 {
+        let dc = GetWindowDC(hwnd);
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        frame_rect(dc, RECT { left: 0, top: 0, right: wr.right - wr.left, bottom: wr.bottom - wr.top }, rgb3(BLACK));
+        let _ = ReleaseDC(hwnd, dc);
+    }
+    result
 }
 
 unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1985,4 +2226,29 @@ mod tests {
         assert_eq!(bar_strip_width(34, 3, 2), 34);
         assert!(bar_strip_width(10, 3, 1) >= 17);
     }
+
+    /// The dropdown button uses the Windows 2.03 scroll-bar arrow (the same
+    /// glyph PR #4 checks against the 2.03 screenshot), pointing down.
+    #[test]
+    fn combo_arrow_is_the_win2_scrollbar_glyph() {
+        let up = ["....#....", "...###...", "..#####..", ".#######.", "#########", "...###...", "...###...", "...###...", "...###...", "...###..."];
+        for (row, line) in up.iter().enumerate() {
+            let (from, to) = win2_arrow_row(row as i32);
+            for (col, ch) in line.chars().enumerate() {
+                let lit = (col as i32) >= from && (col as i32) <= to;
+                assert_eq!(lit, ch == '#', "glyph row {} col {}", row, col);
+            }
+        }
+        assert_eq!(COMBO_BTN_W, 15);
+    }
+
+    #[test]
+    fn combo_unit_scales_with_dpi() {
+        assert_eq!(combo_unit(96), 1);
+        assert_eq!(combo_unit(120), 1);
+        assert_eq!(combo_unit(144), 1);
+        assert_eq!(combo_unit(168), 2);
+        assert_eq!(combo_unit(192), 2);
+    }
+
 }
