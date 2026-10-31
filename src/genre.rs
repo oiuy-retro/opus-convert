@@ -86,14 +86,15 @@ pub fn save_stored_key(key: &str) -> Result<(), String> {
     save_key_to(&stored_key_path(), key)
 }
 
-/// Key shown in the Options box. AppData first, then `lastfm.key` beside the exe.
+/// Key shown in the Options box. AppData first, then the key file
+/// (`[opus-convert] lastfm_key_file`, default `lastfm.key` beside the exe).
 pub fn key_for_box() -> String {
     let stored = read_key_file(&stored_key_path());
     if !stored.is_empty() {
         return stored;
     }
-    if let Ok(dir) = crate::tools::exe_dir() {
-        return read_key_file(&dir.join("lastfm.key"));
+    if let Some(path) = crate::tools::lastfm_key_file() {
+        return read_key_file(&path);
     }
     String::new()
 }
@@ -109,8 +110,8 @@ pub fn api_key() -> String {
     if !stored.is_empty() {
         return stored;
     }
-    if let Ok(dir) = crate::tools::exe_dir() {
-        return read_key_file(&dir.join("lastfm.key"));
+    if let Some(path) = crate::tools::lastfm_key_file() {
+        return read_key_file(&path);
     }
     String::new()
 }
@@ -281,13 +282,17 @@ pub fn prepare_musicnn(python: &Path, script: &Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Ok(dir) = crate::tools::exe_dir() {
-        let mut path = dir.to_string_lossy().into_owned();
+        let (path_front, home) = python_env(python, &dir);
+        let mut path = path_front.to_string_lossy().into_owned();
         if let Some(old) = std::env::var_os("PATH") {
             path.push(';');
             path.push_str(&old.to_string_lossy());
         }
         command.env("PATH", path);
-        command.env("PYTHONHOME", &dir);
+        match home {
+            Some(home) => command.env("PYTHONHOME", home),
+            None => command.env_remove("PYTHONHOME"),
+        };
         command.env_remove("PYTHONPATH");
         command.env("TF_CPP_MIN_LOG_LEVEL", "3");
         command.env("PYTHONIOENCODING", "utf-8");
@@ -354,14 +359,20 @@ pub fn encode(text: &str) -> String {
     out
 }
 
-pub fn python_next_to_exe() -> Result<PathBuf, String> {
-    let dir = crate::tools::exe_dir()?;
-    for candidate in [dir.join("python.exe"), dir.join("venv").join("Scripts").join("python.exe")] {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
+/// What goes in front of PATH, and PYTHONHOME, for `python`. Python beside the
+/// exe or in `venv\Scripts` beside it keeps the settings older versions used
+/// (the exe folder for both). Python elsewhere gets its own folder; inside a
+/// virtual environment (`pyvenv.cfg` next to it or one folder up) PYTHONHOME
+/// is left unset.
+pub fn python_env(python: &Path, exe_dir: &Path) -> (PathBuf, Option<PathBuf>) {
+    let py_dir = python.parent().map(Path::to_path_buf).unwrap_or_else(|| exe_dir.to_path_buf());
+    let legacy = py_dir == exe_dir || python == exe_dir.join("venv").join("Scripts").join("python.exe");
+    if legacy {
+        return (exe_dir.to_path_buf(), Some(exe_dir.to_path_buf()));
     }
-    Err("Put python.exe (with musicnn) in the same folder as Opus Convert.exe.".into())
+    let venv = py_dir.join("pyvenv.cfg").is_file() || py_dir.parent().is_some_and(|up| up.join("pyvenv.cfg").is_file());
+    let front = PathBuf::from(format!("{};{}", py_dir.display(), exe_dir.display()));
+    (front, if venv { None } else { Some(py_dir) })
 }
 
 pub fn script_next_to_exe() -> Result<PathBuf, String> {
@@ -376,6 +387,16 @@ pub fn script_next_to_exe() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_env_keeps_old_settings_beside_the_exe() {
+        let exe = Path::new(r"C:\App");
+        assert_eq!(python_env(&exe.join("python.exe"), exe), (exe.to_path_buf(), Some(exe.to_path_buf())));
+        let venv = exe.join("venv").join("Scripts").join("python.exe");
+        assert_eq!(python_env(&venv, exe), (exe.to_path_buf(), Some(exe.to_path_buf())));
+        let other = Path::new(r"C:\NoSuchPython37\python.exe");
+        assert_eq!(python_env(other, exe), (PathBuf::from(r"C:\NoSuchPython37;C:\App"), Some(PathBuf::from(r"C:\NoSuchPython37"))));
+    }
 
     #[test]
     fn lastfm_empty_tags_means_no_track() {

@@ -2,6 +2,7 @@
 
 mod aero;
 mod bitrate;
+mod config;
 mod convert;
 mod cover;
 mod genre;

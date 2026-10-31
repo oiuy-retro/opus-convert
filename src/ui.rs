@@ -2264,7 +2264,7 @@ impl App {
             }
             3 => {
                 if self.options.lookup_genre {
-                    if let Err(err) = crate::genre::python_next_to_exe() {
+                    if let Err(err) = crate::tools::find_python() {
                         return Action::Popup(err);
                     }
                     if let Err(err) = crate::genre::script_next_to_exe() {
