@@ -23,6 +23,12 @@ ffprobe = auto
 # Python with musicnn, for genre lookup. "auto" also checks venv\Scripts\.
 python = auto
 
+[folders]
+# The folder each Browse button opens at. Opus Convert fills these in when
+# you pick a folder with Browse.
+input =
+output =
+
 [opus-convert]
 # File with your Last.fm API key, relative to the folder Opus Convert.exe is
 # in unless it is a full path. The key typed in the Options page (stored in

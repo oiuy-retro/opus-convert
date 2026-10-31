@@ -246,6 +246,29 @@ pub fn resolve(value: &str, exe_dir: &Path) -> PathBuf {
     crate::paths::full(&path)
 }
 
+/// The closest folder that still exists: `path` itself, else its nearest
+/// existing parent. None when nothing on the way exists.
+pub fn nearest_existing(path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    path.ancestors()
+        .find(|dir| !dir.as_os_str().is_empty() && crate::paths::extended(dir).is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Where a Browse button opens: `[folders] <key>`, or its nearest existing
+/// parent. None (use the default) when unset or nothing on the way exists.
+pub fn browse_start(conf: &Conf, key: &str, exe_dir: &Path) -> Option<PathBuf> {
+    let value = conf.get("folders", key)?;
+    nearest_existing(&resolve(value, exe_dir))
+}
+
+/// Remember the folder picked with a Browse button.
+pub fn remember_folder(conf: &Conf, key: &str, folder: &str) -> Result<(), String> {
+    save_value(conf, "folders", key, folder.trim())
+}
+
 fn listed(paths: &[PathBuf]) -> String {
     const SHOW: usize = 12;
     let mut parts: Vec<String> = paths.iter().take(SHOW).map(|p| crate::paths::display_path(p)).collect();
@@ -346,6 +369,8 @@ mod tests {
         assert_eq!(conf.get("tools", "ffmpeg"), Some("auto"));
         assert_eq!(conf.get("tools", "python"), Some("auto"));
         assert_eq!(conf.get("opus-convert", "lastfm_key_file"), Some("lastfm.key"));
+        assert_eq!(conf.get("folders", "input"), None);
+        assert_eq!(conf.get("folders", "output"), None);
     }
 
     #[test]
@@ -499,5 +524,46 @@ mod tests {
         assert_eq!(expand_vars("%OPUS_CONF_X%\\y"), "abc\\y");
         assert_eq!(expand_vars("%OPUS_CONF_NOT_SET_1%\\y"), "%OPUS_CONF_NOT_SET_1%\\y");
         assert_eq!(expand_vars("50% off"), "50% off");
+    }
+
+    #[test]
+    fn browse_opens_at_the_nearest_existing_folder() {
+        let root = temp("near");
+        fs::create_dir_all(root.join("Music").join("Jazz")).unwrap();
+        let conf = |value: &str| Conf::parse(&format!("[folders]\ninput = {value}\n"), None);
+        let jazz = root.join("Music").join("Jazz");
+        assert_eq!(browse_start(&conf(&jazz.to_string_lossy()), "input", &root), Some(jazz.clone()));
+        let gone = jazz.join("Old").join("Deeper");
+        assert_eq!(browse_start(&conf(&gone.to_string_lossy()), "input", &root), Some(jazz.clone()));
+        let slashed = gone.to_string_lossy().replace('\\', "/");
+        assert_eq!(browse_start(&conf(&slashed), "input", &root), Some(jazz.clone()));
+        assert_eq!(browse_start(&conf("Music/Gone"), "input", &root), Some(root.join("Music")));
+        assert_eq!(browse_start(&conf(""), "input", &root), None);
+        assert_eq!(browse_start(&conf(&jazz.to_string_lossy()), "output", &root), None);
+        // A drive that doesn't exist: nothing to open at, so the default is used.
+        assert_eq!(browse_start(&conf(r"Q:\Nope\Music"), "input", &root), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remembering_a_folder_rewrites_only_that_line() {
+        let dir = temp("remember");
+        let conf = load_from(&dir, None);
+        let path = dir.join(FILE_NAME);
+        remember_folder(&conf, "input", r"D:\Music").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, TEMPLATE.replace("input =\n", "input = D:\\Music\n"));
+        remember_folder(&conf, "output", r"E:\Out").unwrap();
+        remember_folder(&conf, "input", r"D:\Other").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, TEMPLATE.replace("input =\n", "input = D:\\Other\n").replace("output =\n", "output = E:\\Out\n"));
+        let reread = load_from(&dir, None);
+        assert_eq!(reread.get("folders", "input"), Some(r"D:\Other"));
+        assert_eq!(reread.get("folders", "output"), Some(r"E:\Out"));
+        // An older file without [folders] gets the section added at the end.
+        fs::write(&path, "# mine\r\n[tools]\r\nffmpeg = auto\r\n").unwrap();
+        remember_folder(&load_from(&dir, None), "output", r"E:\Out").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# mine\r\n[tools]\r\nffmpeg = auto\r\n\r\n[folders]\r\noutput = E:\\Out\r\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

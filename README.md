@@ -80,6 +80,8 @@ The file is plain text: `[section]` headers, `key = value` lines, and `#` commen
 
 When a program can't be found, the message names the key, the configuration file, and the places that were checked.
 
+`[folders]` has `input` and `output`: the folder each **Browse** button opens at. Picking a folder with **Browse** saves it there; only that one line in the file is changed. If the saved folder no longer exists, the dialog opens at the nearest parent folder that does, or where the box points if none does. These keys only decide where the dialog opens. The input and output folders a job uses still come from the boxes and are saved with your profiles in `%APPDATA%\Opus Convert\profiles.json` as before.
+
 `[opus-convert]` has `lastfm_key_file`, the file the Last.fm key is read from (default `lastfm.key` next to the exe).
 
 ## Build
