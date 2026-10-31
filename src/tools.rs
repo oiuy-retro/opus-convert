@@ -1,6 +1,8 @@
-//! ffmpeg and ffprobe live in the same folder as Opus Convert.exe.
+//! Finding ffmpeg, ffprobe and Python, following `[tools]` in configuration.conf.
 
 use std::path::{Path, PathBuf};
+
+use crate::config::{self, Conf};
 
 #[derive(Clone, Debug)]
 pub struct Bundle {
@@ -15,23 +17,36 @@ pub fn exe_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "The program folder could not be found.".into())
 }
 
-/// ffmpeg and ffprobe are the copies sitting next to this program.
-pub fn load_bundle() -> Result<Bundle, String> {
+fn find(conf: &Conf, key: &str, file_name: &str, extra: &[PathBuf]) -> Result<PathBuf, String> {
     let dir = exe_dir()?;
-    let ffmpeg = dir.join("ffmpeg.exe");
-    let ffprobe = dir.join("ffprobe.exe");
-    let mut missing = Vec::new();
-    if !ffmpeg.is_file() {
-        missing.push("ffmpeg.exe");
+    let path_var = std::env::var_os("PATH");
+    config::find_tool(conf, key, file_name, &dir, path_var.as_deref(), extra)
+}
+
+/// ffmpeg and ffprobe, as `[tools] ffmpeg` and `[tools] ffprobe` say.
+pub fn load_bundle() -> Result<Bundle, String> {
+    let conf = config::load();
+    let ffmpeg = find(&conf, "ffmpeg", "ffmpeg.exe", &[]);
+    let ffprobe = find(&conf, "ffprobe", "ffprobe.exe", &[]);
+    match (ffmpeg, ffprobe) {
+        (Ok(ffmpeg), Ok(ffprobe)) => Ok(Bundle { ffmpeg, ffprobe }),
+        (Err(a), Err(b)) => Err(format!("{a}\n\n{b}")),
+        (Err(err), _) | (_, Err(err)) => Err(err),
     }
-    if !ffprobe.is_file() {
-        missing.push("ffprobe.exe");
-    }
-    if !missing.is_empty() {
-        return Err(format!(
-            "Put these files in the same folder as Opus Convert.exe: {}.",
-            missing.join(", ")
-        ));
-    }
-    Ok(Bundle { ffmpeg, ffprobe })
+}
+
+/// Python for musicnn, as `[tools] python` says. `auto` also checks
+/// `venv\Scripts\python.exe` beside the exe, where older versions looked.
+pub fn find_python() -> Result<PathBuf, String> {
+    let conf = config::load();
+    let legacy = exe_dir().map(|dir| vec![dir.join("venv").join("Scripts").join("python.exe")]).unwrap_or_default();
+    find(&conf, "python", "python.exe", &legacy)
+}
+
+/// `[opus-convert] lastfm_key_file`, default `lastfm.key` beside the exe.
+pub fn lastfm_key_file() -> Option<PathBuf> {
+    let dir = exe_dir().ok()?;
+    let conf = config::load();
+    let value = conf.get("opus-convert", "lastfm_key_file").unwrap_or("lastfm.key");
+    Some(config::resolve(value, &dir))
 }

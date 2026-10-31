@@ -1,0 +1,37 @@
+# Opus Convert settings.
+#
+# Opus Convert reads this file from the folder Opus Convert.exe is in. If that
+# folder can't be written to (for example under Program Files), it uses
+# %APPDATA%\Opus Convert\configuration.conf instead.
+#
+# Lines starting with # are comments. Keys and section names don't care about
+# letter case. A missing key, or a key with nothing after "=", uses the default.
+# Delete this file to get a fresh copy with the defaults.
+
+[tools]
+# Where to find each program Opus Convert runs.
+#   auto  Look next to Opus Convert.exe, then in each folder beside it
+#         (like ffmpeg\ffmpeg.exe), then in their bin folders
+#         (like ffmpeg\bin\ffmpeg.exe), then on PATH.
+#   path  Only look on PATH.
+#   Anything else is the path to the program, or to the folder it is in.
+#   It can be relative to the folder Opus Convert.exe is in, use / or \,
+#   and use %VARIABLES% like %USERPROFILE%. Opus Convert uses only that
+#   path and shows an error if the program isn't there.
+ffmpeg = auto
+ffprobe = auto
+# Python with musicnn, for genre lookup. "auto" also checks venv\Scripts\.
+python = auto
+
+[folders]
+# The folder each Browse button opens at. Opus Convert fills these in when
+# you pick a folder with Browse.
+input =
+output =
+
+[opus-convert]
+# File with your Last.fm API key, relative to the folder Opus Convert.exe is
+# in unless it is a full path. The key typed in the Options page (stored in
+# %APPDATA%\Opus Convert\lastfm.key) and the LASTFM_API_KEY variable are used
+# first if they are set.
+lastfm_key_file = lastfm.key

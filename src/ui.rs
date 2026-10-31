@@ -617,9 +617,20 @@ fn browse(input: bool) {
         (app.hwnd, current)
     });
     let title = if input { "Input" } else { "Output" };
-    let Some(path) = pick_folder(hwnd, &current, title) else {
+    // Open at this button's last-used folder from configuration.conf
+    // ([folders] input / output), or its nearest existing parent. Otherwise
+    // open where the box points, as before.
+    let key = if input { "input" } else { "output" };
+    let conf = crate::config::load();
+    let start = tools::exe_dir()
+        .ok()
+        .and_then(|dir| crate::config::browse_start(&conf, key, &dir))
+        .map(|dir| paths::display_path(&dir))
+        .unwrap_or(current);
+    let Some(path) = pick_folder(hwnd, &start, title) else {
         return;
     };
+    let _ = crate::config::remember_folder(&conf, key, &path);
     APP.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let app = borrow.as_mut().unwrap();
@@ -2264,7 +2275,7 @@ impl App {
             }
             3 => {
                 if self.options.lookup_genre {
-                    if let Err(err) = crate::genre::python_next_to_exe() {
+                    if let Err(err) = crate::tools::find_python() {
                         return Action::Popup(err);
                     }
                     if let Err(err) = crate::genre::script_next_to_exe() {
