@@ -545,6 +545,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Fill empty `key =` lines. The example file may be LF or CRLF after checkout.
+    fn assigned(template: &str, pairs: &[(&str, &str)]) -> String {
+        let nl = if template.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut text = template.to_string();
+        for (key, value) in pairs {
+            text = text.replace(&format!("{key} ={nl}"), &format!("{key} = {value}{nl}"));
+        }
+        text
+    }
+
     #[test]
     fn remembering_a_folder_rewrites_only_that_line() {
         let dir = temp("remember");
@@ -552,11 +562,11 @@ mod tests {
         let path = dir.join(FILE_NAME);
         remember_folder(&conf, "input", r"D:\Music").unwrap();
         let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, TEMPLATE.replace("input =\n", "input = D:\\Music\n"));
+        assert_eq!(after, assigned(TEMPLATE, &[("input", r"D:\Music")]));
         remember_folder(&conf, "output", r"E:\Out").unwrap();
         remember_folder(&conf, "input", r"D:\Other").unwrap();
         let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, TEMPLATE.replace("input =\n", "input = D:\\Other\n").replace("output =\n", "output = E:\\Out\n"));
+        assert_eq!(after, assigned(TEMPLATE, &[("input", r"D:\Other"), ("output", r"E:\Out")]));
         let reread = load_from(&dir, None);
         assert_eq!(reread.get("folders", "input"), Some(r"D:\Other"));
         assert_eq!(reread.get("folders", "output"), Some(r"E:\Out"));
