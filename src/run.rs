@@ -394,7 +394,7 @@ fn lookup_genres(
     policy: crate::model::GenrePolicy,
 ) {
     let key = genre::api_key();
-    let python = crate::genre::python_next_to_exe();
+    let python = crate::tools::find_python();
     let script = crate::genre::script_next_to_exe();
     let files = match filter_genre_files(shared, ffmpeg, ffprobe, files, policy) {
         Some(files) => files,
